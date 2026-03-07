@@ -7,10 +7,15 @@ import re
 import copy
 import sqlite3
 import threading
+import queue
+import time
+import atexit
+import tempfile
+from decimal import Decimal
 from pathlib import Path
 from collections import defaultdict, deque
 from datetime import datetime, date, time, timedelta, timezone
-from typing import Optional, List, Dict, Any, Callable, Tuple
+from typing import Optional, List, Dict, Any, Callable, Tuple, Set
 import pandas as pd
 from config import (
     NEAR_MISS_THRESHOLD,
@@ -30,9 +35,29 @@ except Exception:  # pragma: no cover - optional dependency for Postgres deploym
     psycopg2_pool = None
     RealDictCursor = None
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency in constrained environments
+    load_dotenv = None
+
+if load_dotenv is not None:
+    # Load project-level .env regardless of current working directory.
+    load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=False)
+
 DB_PATH = os.getenv('DATABASE_PATH', 'data/dashboard.db')
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
+_LOCAL_CACHE_SETTING = os.getenv("LOCAL_CACHE_PRIMARY", "auto").strip().lower()
+_DEFAULT_LOCAL_CACHE_DB_PATH = str(Path(tempfile.gettempdir()) / "renaissance-man" / "postgres_cache.db")
+USE_LOCAL_CACHE_PRIMARY = USE_POSTGRES and (
+    _LOCAL_CACHE_SETTING in {"1", "true", "yes", "on"}
+    or (_LOCAL_CACHE_SETTING in {"", "auto"} and not os.getenv("RENDER"))
+)
+LOCAL_CACHE_DB_PATH = os.path.expandvars(
+    os.path.expanduser(
+        os.getenv("LOCAL_CACHE_DB_PATH", _DEFAULT_LOCAL_CACHE_DB_PATH).strip()
+    )
+)
 POSTGRES_BOOTSTRAP_VERSION = "2026-03-08-perf-v1"
 POSTGRES_BOOTSTRAP_KEY = "postgres_bootstrap_version"
 DOMAIN_XP_PER_LEVEL = 500
@@ -56,8 +81,97 @@ RENAISSANCE_THRESHOLDS = {
 _PG_POOL = None
 _PG_POOL_LOCK = threading.Lock()
 _READ_CACHE_LOCK = threading.Lock()
-_READ_CACHE: Dict[Tuple[Any, ...], Tuple[int, Any]] = {}
+_READ_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 _READ_CACHE_VERSION = 0
+_WRITE_BEHIND_QUEUE: "queue.Queue[List[Tuple[str, Any]]]" = queue.Queue()
+_WRITE_BEHIND_THREAD = None
+_WRITE_BEHIND_LOCK = threading.Lock()
+_WRITE_BEHIND_ATEXIT_REGISTERED = False
+_LOCAL_CACHE_READY = False
+_LOCAL_CACHE_READY_LOCK = threading.Lock()
+_CACHE_TAGS_BY_PREFIX: Dict[str, Set[str]] = {
+    "get_sleep_logs": {"sleep_logs"},
+    "get_exercise_summary": {"exercise_resistance", "exercise_cardio"},
+    "get_weight_logs": {"weight_logs"},
+    "get_health_summary": {"weight_logs", "daily_health_logs"},
+    "get_recent_daily_health_logs": {"daily_health_logs"},
+    "get_weight_trend": {"weight_logs"},
+    "get_exercise_trend": {"exercise_resistance", "exercise_cardio"},
+    "get_active_projects": {"projects", "project_sessions"},
+    "get_project_summary": {"projects", "project_sessions"},
+    "get_all_tasks": {"tasks"},
+    "get_finance_summary": {
+        "weekly_finance",
+        "finance_snapshots",
+        "income_sources",
+        "assets",
+        "liabilities",
+        "finance_fortnights",
+    },
+    "get_net_worth": {"assets", "liabilities"},
+    "get_identity_levels": {"identity_levels", "xp_logs"},
+    "get_overall_level": {"identity_levels", "xp_logs"},
+    "discover_correlations": {"sleep_logs", "exercise_resistance", "exercise_cardio"},
+    "get_daily_quests": {"daily_quests"},
+    "get_routine_templates": {"routine_templates"},
+    "get_routine_items": {"routine_items"},
+    "is_routine_submitted": {"routine_submissions"},
+    "get_today_routine_progress": {"daily_routine_progress"},
+}
+
+
+def _cache_tags_for_key(key: Tuple[Any, ...]) -> Set[str]:
+    if not key:
+        return set()
+    prefix = str(key[0])
+    return set(_CACHE_TAGS_BY_PREFIX.get(prefix, set()))
+
+
+def _normalize_table_name(name: str) -> str:
+    if not name:
+        return ""
+    table = name.strip().strip('"').split(".")[-1]
+    return table.strip('"').lower()
+
+
+def _extract_mutated_tables(query: str) -> Set[str]:
+    cleaned = re.sub(r"/\*.*?\*/", " ", query or "", flags=re.S)
+    cleaned = re.sub(r"--.*?$", " ", cleaned, flags=re.M).strip()
+    if not cleaned:
+        return set()
+
+    ident = r'(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)'
+    table_pat = rf'({ident}(?:\.{ident})?)'
+    tables: Set[str] = set()
+
+    patterns = [
+        rf"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+{table_pat}",
+        rf"\bUPDATE\s+(?:ONLY\s+)?{table_pat}",
+        rf"\bDELETE\s+FROM\s+{table_pat}",
+        rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?{table_pat}",
+        rf"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?{table_pat}",
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{table_pat}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if match:
+            normalized = _normalize_table_name(match.group(1))
+            if normalized:
+                tables.add(normalized)
+
+    truncate_match = re.search(
+        rf"\bTRUNCATE\s+(?:TABLE\s+)?(.+?)(?:\s+RESTART|\s+CONTINUE|\s+CASCADE|\s+RESTRICT|;|$)",
+        cleaned,
+        flags=re.IGNORECASE | re.S,
+    )
+    if truncate_match:
+        raw = truncate_match.group(1)
+        for part in raw.split(","):
+            table = _normalize_table_name(part.strip())
+            if table:
+                tables.add(table)
+
+    return tables
 
 
 def _clone_cached_value(value: Any) -> Any:
@@ -68,22 +182,259 @@ def _clone_cached_value(value: Any) -> Any:
     return value
 
 
-def _invalidate_cached_reads():
+def _invalidate_cached_reads(tables: Optional[Set[str]] = None):
     global _READ_CACHE_VERSION
+    keys_to_refresh: List[Tuple[Any, ...]] = []
     with _READ_CACHE_LOCK:
-        _READ_CACHE_VERSION += 1
-        _READ_CACHE.clear()
+        if not tables or "*" in tables:
+            _READ_CACHE_VERSION += 1
+            _READ_CACHE.clear()
+            return
+
+        normalized = {_normalize_table_name(t) for t in tables if t}
+        if not normalized:
+            return
+
+        for key, entry in _READ_CACHE.items():
+            tags = set(entry.get("tags", set()))
+            if not tags or (tags & normalized):
+                entry["stale"] = True
+                if not entry.get("refreshing"):
+                    entry["refreshing"] = True
+                    keys_to_refresh.append(key)
+
+    for key in keys_to_refresh:
+        threading.Thread(
+            target=_refresh_cached_key,
+            args=(key,),
+            daemon=True,
+        ).start()
+
+
+def _refresh_cached_key(key: Tuple[Any, ...]):
+    with _READ_CACHE_LOCK:
+        entry = _READ_CACHE.get(key)
+        if not entry:
+            return
+        loader = entry.get("loader")
+        version = entry.get("version")
+
+    if loader is None:
+        with _READ_CACHE_LOCK:
+            current = _READ_CACHE.get(key)
+            if current and current.get("version") == version:
+                current["refreshing"] = False
+                current["stale"] = False
+        return
+
+    try:
+        value = loader()
+    except Exception:
+        with _READ_CACHE_LOCK:
+            current = _READ_CACHE.get(key)
+            if current and current.get("version") == version:
+                current["refreshing"] = False
+        return
+
+    with _READ_CACHE_LOCK:
+        current = _READ_CACHE.get(key)
+        if current and current.get("version") == version:
+            current["value"] = _clone_cached_value(value)
+            current["stale"] = False
+            current["refreshing"] = False
 
 
 def _cached_read(key: Tuple[Any, ...], loader: Callable[[], Any]) -> Any:
     with _READ_CACHE_LOCK:
-        cached = _READ_CACHE.get(key)
-        if cached and cached[0] == _READ_CACHE_VERSION:
-            return _clone_cached_value(cached[1])
+        entry = _READ_CACHE.get(key)
+        if entry and entry.get("version") == _READ_CACHE_VERSION:
+            if entry.get("stale"):
+                if not entry.get("refreshing"):
+                    entry["refreshing"] = True
+                    threading.Thread(
+                        target=_refresh_cached_key,
+                        args=(key,),
+                        daemon=True,
+                    ).start()
+            return _clone_cached_value(entry.get("value"))
+
     value = loader()
     with _READ_CACHE_LOCK:
-        _READ_CACHE[key] = (_READ_CACHE_VERSION, _clone_cached_value(value))
+        _READ_CACHE[key] = {
+            "version": _READ_CACHE_VERSION,
+            "value": _clone_cached_value(value),
+            "loader": loader,
+            "tags": _cache_tags_for_key(key),
+            "stale": False,
+            "refreshing": False,
+        }
     return _clone_cached_value(value)
+
+
+def _upsert_cached_dataframe_row(
+    prefix: str,
+    row: Dict[str, Any],
+    *,
+    date_column: str = "date",
+    sort_ascending: bool = False,
+    limit_key_index: Optional[int] = None,
+    cutoff_key_index: Optional[int] = None,
+):
+    if not row or date_column not in row:
+        return
+
+    target_date = str(row[date_column])
+    with _READ_CACHE_LOCK:
+        for key, entry in _READ_CACHE.items():
+            if not key or key[0] != prefix:
+                continue
+            value = entry.get("value")
+            if not isinstance(value, pd.DataFrame):
+                continue
+
+            df = value.copy(deep=True)
+            if date_column not in df.columns:
+                continue
+
+            existing_row = {}
+            if not df.empty:
+                existing = df[df[date_column].astype(str) == target_date]
+                if not existing.empty:
+                    existing_row = existing.iloc[0].to_dict()
+                df = df[df[date_column].astype(str) != target_date]
+
+            merged_row = existing_row
+            merged_row.update(row)
+            for col in df.columns:
+                merged_row.setdefault(col, None)
+
+            df = pd.concat([df, pd.DataFrame([merged_row])], ignore_index=True)
+
+            if cutoff_key_index is not None and len(key) > cutoff_key_index:
+                cutoff = str(key[cutoff_key_index])
+                df = df[df[date_column].astype(str) >= cutoff]
+
+            df = df.sort_values(by=date_column, ascending=sort_ascending)
+
+            if limit_key_index is not None and len(key) > limit_key_index:
+                try:
+                    limit = int(key[limit_key_index])
+                    df = df.head(limit)
+                except Exception:
+                    pass
+
+            entry["value"] = df.reset_index(drop=True)
+            entry["stale"] = False
+            entry["refreshing"] = False
+
+
+def _upsert_cached_list_row(
+    prefix: str,
+    row: Dict[str, Any],
+    *,
+    date_column: str = "date",
+    sort_desc: bool = True,
+    limit_key_index: Optional[int] = 1,
+):
+    if not row or date_column not in row:
+        return
+
+    target_date = str(row[date_column])
+    with _READ_CACHE_LOCK:
+        for key, entry in _READ_CACHE.items():
+            if not key or key[0] != prefix:
+                continue
+            value = entry.get("value")
+            if not isinstance(value, list):
+                continue
+
+            rows: List[Dict[str, Any]] = []
+            replaced = False
+            for item in value:
+                if isinstance(item, dict) and str(item.get(date_column, "")) == target_date:
+                    if not replaced:
+                        merged = dict(item)
+                        merged.update(row)
+                        rows.append(merged)
+                        replaced = True
+                    continue
+                rows.append(dict(item) if isinstance(item, dict) else item)
+
+            if not replaced:
+                rows.append(dict(row))
+
+            rows = sorted(
+                rows,
+                key=lambda r: str((r or {}).get(date_column, "")),
+                reverse=bool(sort_desc),
+            )
+
+            if limit_key_index is not None and len(key) > limit_key_index:
+                try:
+                    limit = int(key[limit_key_index])
+                    rows = rows[:limit]
+                except Exception:
+                    pass
+
+            entry["value"] = rows
+            entry["stale"] = False
+            entry["refreshing"] = False
+
+
+def _patch_cached_health_summary(
+    *,
+    logged_date: str,
+    latest_weight: Optional[float] = None,
+):
+    with _READ_CACHE_LOCK:
+        for key, entry in _READ_CACHE.items():
+            if not key or key[0] != "get_health_summary":
+                continue
+            value = entry.get("value")
+            if not isinstance(value, dict):
+                continue
+            updated = dict(value)
+            if latest_weight is not None:
+                existing_date = str(updated.get("latest_weight_date") or "")
+                if not existing_date or logged_date >= existing_date:
+                    updated["latest_weight"] = latest_weight
+                    updated["latest_weight_date"] = logged_date
+            entry["value"] = updated
+            entry["stale"] = False
+            entry["refreshing"] = False
+
+
+def _patch_cached_exercise_summary(
+    *,
+    logged_date: str,
+    resistance_deltas: Optional[Dict[str, float]] = None,
+    cardio_minutes: float = 0.0,
+    cardio_distance: float = 0.0,
+):
+    resistance_deltas = dict(resistance_deltas or {})
+    with _READ_CACHE_LOCK:
+        for key, entry in _READ_CACHE.items():
+            if not key or key[0] != "get_exercise_summary":
+                continue
+            value = entry.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            cutoff = str(key[2]) if len(key) > 2 else ""
+            if cutoff and logged_date < cutoff:
+                continue
+
+            updated = dict(value)
+            resistance = dict(updated.get("resistance") or {})
+            for ex_type, delta in resistance_deltas.items():
+                resistance[ex_type] = float(resistance.get(ex_type) or 0) + float(delta or 0)
+
+            updated["resistance"] = resistance
+            updated["cardio_minutes"] = float(updated.get("cardio_minutes") or 0) + float(cardio_minutes or 0)
+            updated["cardio_distance"] = float(updated.get("cardio_distance") or 0) + float(cardio_distance or 0)
+            entry["value"] = updated
+            entry["stale"] = False
+            entry["refreshing"] = False
 
 
 def _is_mutating_sql(query: str) -> bool:
@@ -182,6 +533,7 @@ class _PostgresConnection:
         self._conn = self._pool.getconn()
         self._closed = False
         self._has_pending_write = False
+        self._mutated_tables: Set[str] = set()
 
     def cursor(self, *args, **kwargs):
         return self._conn.cursor(*args, **kwargs)
@@ -198,12 +550,19 @@ class _PostgresConnection:
         command = first[0].upper() if first else ""
         if command == "COMMIT":
             if self._has_pending_write:
-                _invalidate_cached_reads()
+                _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
             self._has_pending_write = False
+            self._mutated_tables.clear()
         elif command == "ROLLBACK":
             self._has_pending_write = False
+            self._mutated_tables.clear()
         elif _is_mutating_sql(query):
             self._has_pending_write = True
+            tables = _extract_mutated_tables(query)
+            if tables:
+                self._mutated_tables.update(tables)
+            else:
+                self._mutated_tables.add("*")
         return _PostgresCursor(cur)
 
     def executescript(self, script: str):
@@ -216,12 +575,14 @@ class _PostgresConnection:
     def commit(self):
         self._conn.commit()
         if self._has_pending_write:
-            _invalidate_cached_reads()
+            _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
         self._has_pending_write = False
+        self._mutated_tables.clear()
 
     def rollback(self):
         self._conn.rollback()
         self._has_pending_write = False
+        self._mutated_tables.clear()
 
     def close(self):
         if self._closed:
@@ -250,6 +611,7 @@ class _SQLiteConnection:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._has_pending_write = False
+        self._mutated_tables: Set[str] = set()
 
     def execute(self, query: str, params=None):
         if params is None:
@@ -260,23 +622,32 @@ class _SQLiteConnection:
         command = first[0].upper() if first else ""
         if command == "COMMIT":
             if self._has_pending_write:
-                _invalidate_cached_reads()
+                _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
             self._has_pending_write = False
+            self._mutated_tables.clear()
         elif command == "ROLLBACK":
             self._has_pending_write = False
+            self._mutated_tables.clear()
         elif _is_mutating_sql(query):
             self._has_pending_write = True
+            tables = _extract_mutated_tables(query)
+            if tables:
+                self._mutated_tables.update(tables)
+            else:
+                self._mutated_tables.add("*")
         return cur
 
     def commit(self):
         self._conn.commit()
         if self._has_pending_write:
-            _invalidate_cached_reads()
+            _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
         self._has_pending_write = False
+        self._mutated_tables.clear()
 
     def rollback(self):
         self._conn.rollback()
         self._has_pending_write = False
+        self._mutated_tables.clear()
 
     def close(self):
         self._conn.close()
@@ -285,8 +656,236 @@ class _SQLiteConnection:
         return getattr(self._conn, name)
 
 
+class _SQLiteWriteBehindConnection(_SQLiteConnection):
+    def __init__(self, db_path: Path):
+        super().__init__(db_path)
+        self._mirror_ops: List[Tuple[str, Any]] = []
+
+    def execute(self, query: str, params=None):
+        cur = super().execute(query, params)
+        first = (query or "").lstrip().split(None, 1)
+        command = first[0].upper() if first else ""
+        if _is_mutating_sql(query) and command not in {"COMMIT", "ROLLBACK"}:
+            safe_params = tuple(params) if isinstance(params, list) else params
+            self._mirror_ops.append((query, safe_params))
+        return cur
+
+    def commit(self):
+        super().commit()
+        if self._mirror_ops:
+            _enqueue_write_behind(self._mirror_ops)
+            self._mirror_ops = []
+
+    def rollback(self):
+        super().rollback()
+        self._mirror_ops = []
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def _start_write_behind_worker():
+    global _WRITE_BEHIND_THREAD, _WRITE_BEHIND_ATEXIT_REGISTERED
+    with _WRITE_BEHIND_LOCK:
+        if _WRITE_BEHIND_THREAD and _WRITE_BEHIND_THREAD.is_alive():
+            return
+        _WRITE_BEHIND_THREAD = threading.Thread(
+            target=_write_behind_worker_loop,
+            name="postgres-write-behind",
+            daemon=True,
+        )
+        _WRITE_BEHIND_THREAD.start()
+        if not _WRITE_BEHIND_ATEXIT_REGISTERED:
+            atexit.register(_flush_write_behind_queue)
+            _WRITE_BEHIND_ATEXIT_REGISTERED = True
+
+
+def _enqueue_write_behind(ops: List[Tuple[str, Any]]):
+    if not USE_LOCAL_CACHE_PRIMARY:
+        return
+    if not ops:
+        return
+    _WRITE_BEHIND_QUEUE.put(list(ops))
+
+
+def _write_behind_worker_loop():
+    while True:
+        ops = _WRITE_BEHIND_QUEUE.get()
+        if ops is None:
+            _WRITE_BEHIND_QUEUE.task_done()
+            return
+
+        delay_seconds = 0.25
+        while True:
+            conn = None
+            try:
+                conn = _PostgresConnection()
+                for query, params in ops:
+                    conn.execute(query, params)
+                conn.commit()
+                break
+            except Exception as exc:
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                print(f"[write-behind] Postgres sync failed, retrying in {delay_seconds:.2f}s: {exc}")
+                time.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2, 10.0)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        _WRITE_BEHIND_QUEUE.task_done()
+
+
+def _flush_write_behind_queue(timeout_seconds: float = 8.0):
+    deadline = time.time() + max(0.0, float(timeout_seconds))
+    while time.time() < deadline:
+        if _WRITE_BEHIND_QUEUE.empty():
+            return
+        time.sleep(0.05)
+
+
+def _prepare_local_cache_schema(local_conn):
+    schema_path = Path(__file__).parent / "schema.sql"
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema_sql = f.read()
+    local_conn.executescript(schema_sql)
+    _ensure_sleep_log_columns(local_conn)
+    _ensure_daily_health_columns(local_conn)
+    _ensure_exercise_resistance_columns(local_conn)
+    _ensure_identity_level_integrity(local_conn)
+    _deactivate_orphan_routine_items(local_conn)
+    local_conn.execute(
+        """
+        UPDATE xp_logs
+        SET domain = 'health'
+        WHERE domain = 'habits'
+        """
+    )
+    local_conn.commit()
+
+
+def _copy_postgres_to_local_cache(local_conn, pg_conn):
+    def _to_sqlite_value(value: Any):
+        if value is None or isinstance(value, (str, int, float, bytes)):
+            return value
+        if isinstance(value, Decimal):
+            try:
+                return float(value)
+            except Exception:
+                return str(value)
+        if isinstance(value, (datetime, date, time)):
+            return value.isoformat()
+        if isinstance(value, timedelta):
+            return value.total_seconds()
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        if isinstance(value, memoryview):
+            return value.tobytes()
+        if isinstance(value, bytearray):
+            return bytes(value)
+        if isinstance(value, (dict, list, tuple, set)):
+            try:
+                return json.dumps(value)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    tables = [
+        row["name"]
+        for row in local_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    ]
+
+    local_conn.execute("PRAGMA foreign_keys = OFF")
+    for table in tables:
+        cols = [
+            row["name"]
+            for row in local_conn.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall()
+        ]
+        if not cols:
+            continue
+
+        quoted_table = _quote_ident(table)
+        quoted_cols = ", ".join(_quote_ident(c) for c in cols)
+        placeholders = ", ".join("?" for _ in cols)
+
+        try:
+            rows = pg_conn.execute(
+                f"SELECT {quoted_cols} FROM {quoted_table}"
+            ).fetchall()
+        except Exception:
+            # Table might not exist in Postgres if it's local-only; keep local empty.
+            rows = []
+
+        local_conn.execute(f"DELETE FROM {quoted_table}")
+        for row in rows:
+            values = tuple(_to_sqlite_value(row.get(col)) for col in cols)
+            local_conn.execute(
+                f"INSERT INTO {quoted_table} ({quoted_cols}) VALUES ({placeholders})",
+                values,
+            )
+
+        if "id" in cols:
+            try:
+                max_id = local_conn.execute(
+                    f"SELECT COALESCE(MAX(id), 0) AS max_id FROM {quoted_table}"
+                ).fetchone()["max_id"]
+                local_conn.execute(
+                    "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES(?, ?)",
+                    (table, int(max_id or 0)),
+                )
+            except Exception:
+                pass
+
+    local_conn.execute("PRAGMA foreign_keys = ON")
+    local_conn.commit()
+
+
+def _ensure_local_cache_ready(force_refresh: bool = False):
+    global _LOCAL_CACHE_READY
+    if not USE_LOCAL_CACHE_PRIMARY:
+        return
+    if _LOCAL_CACHE_READY and not force_refresh:
+        return
+
+    with _LOCAL_CACHE_READY_LOCK:
+        if _LOCAL_CACHE_READY and not force_refresh:
+            return
+
+        cache_path = Path(LOCAL_CACHE_DB_PATH)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists():
+            cache_path.unlink()
+
+        local_conn = _SQLiteConnection(cache_path)
+        pg_conn = _PostgresConnection()
+        try:
+            _prepare_local_cache_schema(local_conn)
+            _copy_postgres_to_local_cache(local_conn, pg_conn)
+        finally:
+            local_conn.close()
+            pg_conn.close()
+
+        _start_write_behind_worker()
+        _invalidate_cached_reads({"*"})
+        _LOCAL_CACHE_READY = True
+
+
 def get_connection():
     """Get database connection."""
+    if USE_LOCAL_CACHE_PRIMARY:
+        _ensure_local_cache_ready()
+        return _SQLiteWriteBehindConnection(Path(LOCAL_CACHE_DB_PATH))
+
     if USE_POSTGRES:
         if psycopg2 is None:
             raise RuntimeError("DATABASE_URL is set but psycopg2 is not installed")
@@ -298,7 +897,7 @@ def get_connection():
 def _dag_tables_available() -> bool:
     """Return True when core DAG tables exist."""
     conn = get_connection()
-    if USE_POSTGRES:
+    if USE_POSTGRES and not USE_LOCAL_CACHE_PRIMARY:
         rows = conn.execute(
             """
             SELECT table_name AS name
@@ -341,6 +940,51 @@ def _ensure_postgres_performance_indexes(conn):
     ]
     for stmt in index_sql:
         conn.execute(stmt)
+
+
+def _sync_postgres_sequences(conn):
+    """Align Postgres sequences with current MAX(id) values to prevent duplicate-key inserts."""
+    conn.execute(
+        """
+        DO $$
+        DECLARE
+            rec record;
+            max_val bigint;
+        BEGIN
+            FOR rec IN
+                SELECT
+                    cols.table_schema AS schema_name,
+                    cols.table_name,
+                    cols.column_name,
+                    pg_get_serial_sequence(
+                        format('%I.%I', cols.table_schema, cols.table_name),
+                        cols.column_name
+                    ) AS seq_name
+                FROM information_schema.columns cols
+                WHERE cols.table_schema = 'public'
+                  AND pg_get_serial_sequence(
+                        format('%I.%I', cols.table_schema, cols.table_name),
+                        cols.column_name
+                    ) IS NOT NULL
+            LOOP
+                EXECUTE format(
+                    'SELECT COALESCE(MAX(%I), 0) FROM %I.%I',
+                    rec.column_name,
+                    rec.schema_name,
+                    rec.table_name
+                )
+                INTO max_val;
+
+                EXECUTE format(
+                    'SELECT setval(%L, %s, false)',
+                    rec.seq_name,
+                    max_val + 1
+                );
+            END LOOP;
+        END
+        $$;
+        """
+    )
 
 
 def _bootstrap_postgres_if_needed(conn) -> bool:
@@ -508,10 +1152,11 @@ def _install_postgres_compat_functions(conn):
 def init_db():
     """Initialize database with schema."""
     if USE_POSTGRES:
-        conn = get_connection()
+        conn = _PostgresConnection()
         bootstrap_updated = _bootstrap_postgres_if_needed(conn)
         _ensure_identity_level_integrity(conn)
         _deactivate_orphan_routine_items(conn)
+        _sync_postgres_sequences(conn)
         conn.execute(
             """
             UPDATE xp_logs
@@ -521,9 +1166,14 @@ def init_db():
         )
         conn.commit()
         conn.close()
+        if USE_LOCAL_CACHE_PRIMARY:
+            _ensure_local_cache_ready(force_refresh=True)
         if bootstrap_updated and os.getenv("RECALCULATE_IDENTITY_ON_BOOT", "0") == "1":
             recalculate_identity_levels_from_logs()
-        print("Postgres database initialized from existing schema")
+        if USE_LOCAL_CACHE_PRIMARY:
+            print(f"Postgres initialized and local cache hydrated at {LOCAL_CACHE_DB_PATH}")
+        else:
+            print("Postgres database initialized from existing schema (cache-primary disabled)")
         return
 
     schema_path = Path(__file__).parent / 'schema.sql'
@@ -807,6 +1457,28 @@ def log_sleep(date: str, bedtime: str, wake_time: str, wake_mood: int,
     ))
     
     conn.commit()
+    _upsert_cached_dataframe_row(
+        "get_sleep_logs",
+        {
+            "date": date,
+            "bedtime": bedtime,
+            "wake_time": wake_time,
+            "target_bedtime": config.get("target_bedtime"),
+            "target_wake_time": config.get("target_wake_time"),
+            "duration_minutes": duration_min,
+            "wake_mood": wake_mood,
+            "energy": energy,
+            "sleep_quality": sleep_quality,
+            "wakings_count": wakings_count,
+            "sleep_onset": sleep_onset,
+            "wake_method": wake_method,
+            "rested_level": rested_level,
+            "notes": notes,
+        },
+        date_column="date",
+        sort_ascending=False,
+        limit_key_index=1,
+    )
     conn.close()
     for signal in [
         'sleep_logs_count',
@@ -903,6 +1575,10 @@ def log_resistance(date: str, exercise_type: str, reps: int, sets: int = 1,
         VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
     """, (date, workout_id, exercise_type, reps, sets, intensity, notes))
     conn.commit()
+    _patch_cached_exercise_summary(
+        logged_date=date,
+        resistance_deltas={str(exercise_type): float(reps or 0) * float(sets or 0)},
+    )
     conn.close()
     for signal in [
         'resistance_reps',
@@ -962,6 +1638,16 @@ def log_resistance_workout(
             ),
         )
     conn.commit()
+    resistance_deltas: Dict[str, float] = {}
+    for ex in cleaned:
+        ex_type = str(ex["exercise_type"])
+        resistance_deltas[ex_type] = resistance_deltas.get(ex_type, 0.0) + (
+            float(ex["reps"]) * float(ex["sets"])
+        )
+    _patch_cached_exercise_summary(
+        logged_date=date,
+        resistance_deltas=resistance_deltas,
+    )
     conn.close()
 
     for signal in [
@@ -997,6 +1683,11 @@ def log_cardio(date: str, type: str, duration_min: int, distance_km: float = Non
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (date, type, duration_min, distance_km, avg_pace, int(is_intense), notes))
     conn.commit()
+    _patch_cached_exercise_summary(
+        logged_date=date,
+        cardio_minutes=float(duration_min or 0),
+        cardio_distance=float(distance_km or 0),
+    )
     conn.close()
     for signal in [
         'cardio_minutes',
@@ -1064,6 +1755,22 @@ def log_weight(date: str, weight_kg: float, notes: str = ""):
             notes = EXCLUDED.notes
     """, (date, weight_kg, notes))
     conn.commit()
+    _upsert_cached_dataframe_row(
+        "get_weight_logs",
+        {"date": date, "weight_kg": weight_kg, "notes": notes},
+        date_column="date",
+        sort_ascending=False,
+        limit_key_index=1,
+    )
+    _upsert_cached_dataframe_row(
+        "get_weight_trend",
+        {"date": date, "weight_kg": weight_kg, "notes": notes},
+        date_column="date",
+        sort_ascending=True,
+        limit_key_index=None,
+        cutoff_key_index=2,
+    )
+    _patch_cached_health_summary(logged_date=date, latest_weight=float(weight_kg))
     conn.close()
 
 def get_latest_weight() -> Optional[float]:
@@ -1128,6 +1835,22 @@ def log_daily_health(date: str, steps: int = None, calories: int = None,
         int(bool(high_protein)), int(bool(high_carbs)), int(bool(high_fat))
     ))
     conn.commit()
+    _upsert_cached_list_row(
+        "get_recent_daily_health_logs",
+        {
+            "date": date,
+            "steps": steps,
+            "calories": calories,
+            "water_liters": water_liters,
+            "notes": notes,
+            "high_protein": int(bool(high_protein)),
+            "high_carbs": int(bool(high_carbs)),
+            "high_fat": int(bool(high_fat)),
+        },
+        date_column="date",
+        sort_desc=True,
+        limit_key_index=1,
+    )
     conn.close()
     for signal in [
         'daily_health_logs_count',

@@ -26,10 +26,10 @@ RESISTANCE_OPTIONS = [
     {'label': 'Lunges', 'value': 'lunges'},
 ]
 
-def render_health_summary_cards():
+def render_health_summary_cards(health_summary: dict | None = None, exercise_summary: dict | None = None):
     """Build top summary cards from latest DB values."""
-    health_summary = get_health_summary()
-    exercise_summary = get_exercise_summary(days=7)
+    health_summary = health_summary or get_health_summary()
+    exercise_summary = exercise_summary or get_exercise_summary(days=7)
     latest_date = health_summary.get('latest_weight_date')
     latest_date_label = latest_date if latest_date else "--"
 
@@ -75,9 +75,9 @@ def render_health_summary_cards():
         ], md=6, lg=3),
     ], className="mb-4 g-3")
 
-def create_weight_trend_figure(days: int = 90):
+def create_weight_trend_figure(days: int = 90, df: pd.DataFrame | None = None):
     """Create weight-over-time line chart."""
-    df = get_weight_trend(days=days)
+    df = df if df is not None else get_weight_trend(days=days)
     fig = go.Figure()
     if df.empty:
         fig.update_layout(
@@ -128,9 +128,9 @@ def create_weight_trend_figure(days: int = 90):
     )
     return fig
 
-def create_exercise_trend_figure(days: int = 30):
+def create_exercise_trend_figure(days: int = 30, df: pd.DataFrame | None = None):
     """Create stacked reps bars plus cardio line chart."""
-    df = get_exercise_trend(days=days)
+    df = df if df is not None else get_exercise_trend(days=days)
     fig = go.Figure()
     if df.empty:
         fig.update_layout(
@@ -250,10 +250,13 @@ def build_recent_diet_entries(limit: int = 5):
 
     return recent_display
 
-def build_exercise_compass_panel():
+def build_exercise_compass_panel(
+    summary_7: dict | None = None,
+    trend_30: pd.DataFrame | None = None,
+):
     """Render an always-populated exercise guidance panel."""
-    summary_7 = get_exercise_summary(7)
-    trend_30 = get_exercise_trend(30)
+    summary_7 = summary_7 or get_exercise_summary(7)
+    trend_30 = trend_30 if trend_30 is not None else get_exercise_trend(30)
 
     cardio_minutes = float(summary_7.get('cardio_minutes') or 0)
     resistance_total = float(sum((summary_7.get('resistance') or {}).values()) or 0)
@@ -318,9 +321,9 @@ def build_exercise_compass_panel():
     ], className="health-recent-feed")
 
 
-def render_weekly_exercise_snapshot_cards():
+def render_weekly_exercise_snapshot_cards(exercise_summary: dict | None = None):
     """Render the weekly snapshot cards using live exercise summary values."""
-    exercise_summary = get_exercise_summary(days=7)
+    exercise_summary = exercise_summary or get_exercise_summary(days=7)
     return dbc.Row(
         [
             dbc.Col(
@@ -962,10 +965,15 @@ def log_weight_entry(n_clicks, date_val, weight_val, notes, refresh_count):
 )
 def refresh_health_reporting(_refresh):
     """Refresh summary and trend charts after new logs."""
+    health_summary = get_health_summary()
+    exercise_summary = get_exercise_summary(days=7)
+    weight_trend = get_weight_trend(days=90)
+    exercise_trend = get_exercise_trend(days=30)
+
     return (
-        render_health_summary_cards(),
-        render_weekly_exercise_snapshot_cards(),
-        create_weight_trend_figure(90),
-        create_exercise_trend_figure(30),
-        build_exercise_compass_panel()
+        render_health_summary_cards(health_summary, exercise_summary),
+        render_weekly_exercise_snapshot_cards(exercise_summary),
+        create_weight_trend_figure(90, weight_trend),
+        create_exercise_trend_figure(30, exercise_trend),
+        build_exercise_compass_panel(exercise_summary, exercise_trend),
     )
