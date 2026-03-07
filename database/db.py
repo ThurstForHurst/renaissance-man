@@ -53,8 +53,9 @@ def _adapt_query_for_postgres(query: str) -> str:
     q = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", q, flags=re.IGNORECASE)
     if "ON CONFLICT" not in q.upper() and "INSERT INTO" in q.upper() and "OR IGNORE" in query.upper():
         q = q.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
-    q = q.replace("%", "%%")
     q = q.replace("?", "%s")
+    # Escape literal percent signs for psycopg2 paramstyle, while preserving %s placeholders.
+    q = re.sub(r"%(?!s)", "%%", q)
     return q
 
 
