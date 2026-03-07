@@ -95,10 +95,11 @@ class _PostgresConnection:
 
     def execute(self, query: str, params=None):
         cur = self._conn.cursor(cursor_factory=RealDictCursor)
-        pg_query = _adapt_query_for_postgres(query)
         if params is None:
-            cur.execute(pg_query)
+            # Keep raw SQL intact (e.g., PL/pgSQL bodies that use '%' in RAISE format strings).
+            cur.execute(query)
         else:
+            pg_query = _adapt_query_for_postgres(query)
             cur.execute(pg_query, params)
         return _PostgresCursor(cur)
 
