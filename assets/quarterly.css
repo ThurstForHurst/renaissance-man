@@ -1,0 +1,103 @@
+.quarterly-page {
+  max-width: 1320px;
+}
+
+.quarterly-muted {
+  color: #5b6472;
+}
+
+.quarterly-header-card,
+.quarterly-goal-card,
+.quarterly-side-card,
+.quarterly-subcard {
+  border: 1px solid #d9dee7;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.quarterly-archived-goal {
+  opacity: 0.75;
+}
+
+.quarterly-big-number {
+  font-weight: 700;
+  font-size: 1.25rem;
+}
+
+.quarterly-phase-badge {
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.6rem;
+}
+
+.quarterly-segmented-bar {
+  position: relative;
+  height: 16px;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid #cdd5e0;
+  background: #eef2f7;
+}
+
+.quarterly-bar-execution {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 76.9%;
+  height: 100%;
+  background: #e7edf8;
+}
+
+.quarterly-bar-review {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 23.1%;
+  height: 100%;
+  background: #f4f1e7;
+}
+
+.quarterly-bar-boundary {
+  position: absolute;
+  left: 76.9%;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  background: #8a93a2;
+  z-index: 2;
+}
+
+.quarterly-bar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: linear-gradient(90deg, #0b4a8b 0%, #2d7ac9 100%);
+  z-index: 1;
+}
+
+.quarterly-progress-caption {
+  margin-top: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.quarterly-kpi-text {
+  font-weight: 600;
+}
+
+.quarterly-history-list {
+  margin-bottom: 0;
+  padding-left: 1.1rem;
+  font-size: 0.88rem;
+}
+
+@media (max-width: 992px) {
+  .quarterly-progress-caption {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+}

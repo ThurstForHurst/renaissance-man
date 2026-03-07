@@ -1,0 +1,172 @@
+.routines-sidebar-shell {
+  background: linear-gradient(180deg, #fbfcfe 0%, #f2f5f9 100%) !important;
+  border-right: 1px solid #d9e1ea !important;
+  box-shadow: 4px 0 18px rgba(15, 23, 42, 0.08);
+}
+
+.routines-sidebar-shell.open {
+  padding-right: 4px;
+}
+
+.routines-sidebar-shell.collapsed {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 10px;
+}
+
+.sidebar-content-shell {
+  padding-right: 0;
+}
+
+.sidebar-content-shell > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.72rem;
+}
+
+.sidebar-section {
+  border: 1px solid rgba(217, 225, 234, 0.9);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 0.56rem 0.58rem;
+}
+
+.sidebar-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.42rem;
+}
+
+.sidebar-content-shell h5 {
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.sidebar-content-shell h6 {
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #5f6f84;
+}
+
+.sidebar-content-shell small.text-muted {
+  font-size: 0.74rem;
+  line-height: 1.2;
+}
+
+.sidebar-routine-card,
+.sidebar-quest-card,
+.sidebar-task-card {
+  border: 1px solid #e3e8ef;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.sidebar-routine-card .card-body,
+.sidebar-quest-card .card-body,
+.sidebar-task-card .card-body {
+  padding: 0.46rem 0.58rem;
+}
+
+.sidebar-routine-check .form-check-label {
+  color: #223046;
+  font-size: 0.83rem;
+  line-height: 1.2;
+}
+
+.sidebar-routine-subcheck .form-check-label {
+  color: #4a5b73;
+  font-size: 0.77rem;
+  line-height: 1.17;
+}
+
+.sidebar-routine-check .form-check-input {
+  border-color: #8ea2ba;
+  margin-top: 0.18rem;
+}
+
+.sidebar-quest-card .form-check-label .d-block {
+  font-size: 0.82rem;
+  line-height: 1.22;
+}
+
+.sidebar-quest-card .form-check-label small {
+  font-size: 0.72rem;
+  line-height: 1.15;
+}
+
+.sidebar-quest-card .badge {
+  font-size: 0.63rem;
+  padding: 0.18rem 0.34rem;
+}
+
+.sidebar-task-card .card-body {
+  padding-top: 0.42rem;
+  padding-bottom: 0.42rem;
+}
+
+.sidebar-toggle-btn,
+.sidebar-collapsed-toggle {
+  border-radius: 10px !important;
+  background: #ffffff !important;
+  border-color: #d9e1ea !important;
+  color: #1f2d3d !important;
+}
+
+.sidebar-toggle-btn:hover,
+.sidebar-collapsed-toggle:hover {
+  background: #eef3f8 !important;
+}
+
+.sidebar-open-count {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  background: #c53030;
+  color: #ffffff;
+  border-radius: 999px;
+  min-width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+  border: 1px solid #ffffff;
+  z-index: 2200;
+}
+
+.sidebar-manage-routines-btn {
+  border-radius: 8px !important;
+  font-weight: 600;
+  padding-top: 0.3rem !important;
+  padding-bottom: 0.3rem !important;
+  font-size: 0.76rem !important;
+}
+
+.sidebar-task-input-group .form-control,
+.sidebar-task-input-group .btn {
+  border-radius: 8px !important;
+  min-height: 30px;
+  font-size: 0.78rem;
+}
+
+.sidebar-task-card .form-check-label {
+  color: #223046;
+  font-size: 0.8rem;
+  line-height: 1.18;
+}
+
+.sidebar-task-card .form-check-input {
+  border-color: #8ea2ba;
+  margin-top: 0.17rem;
+}
+
+.sidebar-task-check .form-check-input:checked ~ .form-check-label {
+  text-decoration: line-through;
+  color: #6b7280;
+}

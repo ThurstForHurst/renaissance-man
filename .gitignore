@@ -1,0 +1,35 @@
+# Database - NEVER commit personal data
+data/*.db
+data/*.db-journal
+data/*.db-shm
+data/*.db-wal
+backups/
+
+# Environment
+.env
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Distribution
+build/
+dist/
+*.egg-info/

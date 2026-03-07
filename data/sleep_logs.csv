@@ -1,0 +1,12 @@
+id,date,bedtime,wake_time,target_bedtime,target_wake_time,duration_minutes,wake_mood,energy,sleep_quality,bed_routine_completed,wake_routine_completed,notes,created_at,wakings_count,sleep_onset,wake_method,rested_level
+1,2026-02-23,00:00,06:30,22:30,06:30,390,4,3,81.2,0,0,"I stayed up late watching Big Hero 6 with Jess and Tash. The movie was only average, but afterwards we were joking and they made me cry from laughter. I can't say that feeling a little tired today isn't worth the enjoyment of that type of family time. It only means that my work day will be slightly worse that horrid anyway.",2026-02-22 22:03:34,0,easy,on_time,2
+2,2026-02-26,23:00,06:20,22:30,06:30,440,3,2,72.3,0,0,,2026-02-25 22:25:17,0,normal,before_630,2
+3,2026-02-27,22:30,06:00,22:30,06:30,450,2,3,74,0,0,"I probably interfered with proper sleep hygiene by eating a bacon deluxe hunger tamer prior to bed. Even though I had a decent amount of sleep hours-wise, I still feel tired. This is likely due to sleep debt from the last few nights as well.",2026-02-26 21:52:19,0,normal,before_630,2
+4,2026-02-28,23:00,06:30,22:30,06:30,450,4,4,84.2,0,0,"I went to bed a little late, but I feel quite a bit better than yesterday. I still feel like I have a little sleep debt, but overall, on the mend.",2026-02-27 22:21:37,0,normal,on_time,3
+5,2026-03-01,23:30,06:30,22:30,06:30,420,4,3,80.5,0,0,I went to bed slightly late after dropping Tash off at her party and getting McDonalds.,2026-02-28 22:21:37,0,normal,on_time,3
+6,2026-03-02,22:00,06:15,22:30,06:30,495,2,4,78,0,0,"I went to be early, but I think I still have some sleep debt. I need to go to bed on time the next few days to ensure I regain my energy and don't burn out.",2026-03-01 21:25:27,0,normal,on_time,2
+8,2026-03-03,00:30,06:15,22:30,06:30,345,3,2,69.9,0,0,I was hornswoggled by a ChatGPT conversation.,2026-03-02 21:29:15,0,normal,on_time,2
+9,2026-03-04,22:00,06:30,22:30,06:30,510,4,4,84.2,0,0,"Went to bed a little early. I still have some sleep debt, I think, but I do feel on my way to better energy.",2026-03-03 22:11:51,0,normal,on_time,3
+11,2026-03-05,00:30,07:30,22:30,06:30,420,4,4,79.2,0,0,,2026-03-04 22:52:53,0,normal,slept_in,4
+12,2026-03-06,23:00,06:30,22:30,06:30,450,5,4,89.2,0,0,,2026-03-05 23:29:41,0,normal,on_time,4
+14,2026-03-07,00:30,08:30,22:30,06:30,480,5,5,88.8,0,0,,2026-03-07 00:41:55,1,normal,on_time,4

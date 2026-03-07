@@ -1,0 +1,85 @@
+.journal-page {
+  color: #1f2a36;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+.journal-current-shell {
+  border: 1px solid rgba(31, 42, 54, 0.14);
+  border-radius: 8px;
+  padding: 0.75rem 0.85rem;
+  background: #ffffff;
+}
+
+.journal-editor {
+  width: 100%;
+  min-height: 560px;
+  border: 0;
+  border-radius: 0;
+  resize: vertical;
+  padding: 0.25rem 0.1rem;
+  font-size: 1rem;
+  line-height: 1.6;
+  background: #ffffff;
+}
+
+.journal-editor:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.journal-metric-card {
+  border: 1px solid #e3e8ef;
+  border-radius: 10px;
+  background: #fbfdff;
+}
+
+.journal-card-title {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.7rem;
+  color: #64748b;
+  font-weight: 700;
+}
+
+.journal-entry-body {
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.journal-history-shell {
+  border: 1px solid rgba(31, 42, 54, 0.14);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 0.75rem 0.85rem;
+}
+
+.journal-history-summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #1f2a36;
+}
+
+.journal-history-summary::-webkit-details-marker {
+  color: #64748b;
+}
+
+.journal-notes {
+  border-top: 1px dashed #e3e8ef;
+  padding-top: 0.4rem;
+}
+
+.journal-notes-summary {
+  cursor: pointer;
+  color: #64748b;
+  font-size: 0.78rem;
+}
+
+.journal-notes-full {
+  margin-top: 0.4rem;
+  font-size: 0.82rem;
+  color: #334155;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}

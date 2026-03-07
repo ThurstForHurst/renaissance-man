@@ -1,0 +1,70 @@
+.health-panel {
+  border: 1px solid #e9ecef;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+}
+
+.health-panel .card-body {
+  flex: 1 1 auto;
+}
+
+.health-log-card .card-body {
+  padding: 1rem 1.1rem;
+}
+
+.health-side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.health-metric-card {
+  border: 1px solid #e9ecef;
+}
+
+.health-metric-card .card-body {
+  min-height: 116px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.weight-entry-card {
+  border-radius: 12px;
+  background: linear-gradient(145deg, #fbfdff 0%, #f6f9fc 100%);
+}
+
+.weight-entry-card .card-body {
+  padding: 1rem;
+}
+
+#health-tabs .nav-link {
+  color: #495057;
+  font-weight: 600;
+}
+
+#health-tabs .nav-link.active {
+  color: #0d6efd;
+  background-color: #f8fbff;
+  border-color: #dbe7f6 #dbe7f6 #fff;
+}
+
+#health-tabs .tab-content {
+  padding-top: 0.35rem;
+}
+
+#health-tabs .nav-link {
+  font-size: 0.92rem;
+  padding: 0.45rem 0.75rem;
+}
+
+.health-recent-feed {
+  min-height: 180px;
+}
+
+.health-insight-strip {
+  border-top: 1px solid #edf1f6;
+  margin-top: 0.35rem;
+  padding-top: 0.35rem;
+}

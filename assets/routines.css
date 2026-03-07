@@ -1,0 +1,17 @@
+.routine-item-modal {
+  z-index: 3000 !important;
+}
+
+.routine-item-modal-backdrop {
+  z-index: 2990 !important;
+}
+
+.routine-item-modal-dialog {
+  margin-top: 150px !important;
+  z-index: 3005 !important;
+}
+
+.routine-item-modal-content {
+  position: relative;
+  z-index: 3010 !important;
+}

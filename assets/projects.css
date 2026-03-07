@@ -1,0 +1,32 @@
+.new-project-modal {
+  z-index: 3000 !important;
+}
+
+.new-project-modal-backdrop {
+  z-index: 2990 !important;
+}
+
+.new-project-modal-dialog {
+  margin-top: 130px !important;
+  z-index: 3005 !important;
+}
+
+.new-project-modal-content {
+  position: relative;
+  z-index: 3010 !important;
+}
+
+.project-card-clean {
+  border: 1px solid #e9ecef;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.project-card-clean:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.08) !important;
+}
+
+.task-inbox-check .form-check-input:checked ~ .form-check-label {
+  text-decoration: line-through;
+  color: #6b7280;
+}
