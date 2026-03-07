@@ -28,11 +28,12 @@ def get_identity_statement() -> str:
         statements.append("You're developing serious upper body strength")
     
     # Check projects
+    cutoff_date = (datetime.now() - timedelta(days=7)).date().isoformat()
     conn = get_connection()
     sessions = conn.execute("""
         SELECT COUNT(*) as count FROM project_sessions 
-        WHERE date >= date('now', '-7 days')
-    """).fetchone()
+        WHERE date >= ?
+    """, (cutoff_date,)).fetchone()
     conn.close()
     
     if sessions['count'] >= 5:
@@ -86,6 +87,7 @@ def get_morning_message() -> str:
 
 def get_momentum_alert() -> str:
     """Get a momentum-based positive alert."""
+    cutoff_date = (datetime.now() - timedelta(days=7)).date().isoformat()
     conn = get_connection()
     
     # Check for streaks
@@ -93,9 +95,9 @@ def get_momentum_alert() -> str:
         SELECT COUNT(*) as streak FROM (
             SELECT date FROM sleep_logs 
             WHERE bed_routine_completed = 1 
-            AND date >= date('now', '-7 days')
+            AND date >= ?
         )
-    """).fetchone()
+    """, (cutoff_date,)).fetchone()
     
     if sleep_streak['streak'] >= 5:
         conn.close()
@@ -105,8 +107,8 @@ def get_momentum_alert() -> str:
     exercise_days = conn.execute("""
         SELECT COUNT(DISTINCT date) as days 
         FROM exercise_cardio 
-        WHERE date >= date('now', '-7 days')
-    """).fetchone()
+        WHERE date >= ?
+    """, (cutoff_date,)).fetchone()
     
     conn.close()
     
