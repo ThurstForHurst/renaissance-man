@@ -160,6 +160,68 @@ def _dag_tables_available() -> bool:
 def _install_postgres_compat_functions(conn):
     conn.execute(
         """
+        CREATE OR REPLACE FUNCTION public.julianday(input_text text)
+        RETURNS double precision
+        LANGUAGE SQL
+        IMMUTABLE
+        AS $$
+          SELECT EXTRACT(EPOCH FROM (
+            CASE
+              WHEN lower(input_text) = 'now' THEN now()::timestamp
+              ELSE input_text::timestamp
+            END
+          )) / 86400.0
+        $$;
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE FUNCTION public.julianday(input_ts timestamp WITHOUT TIME ZONE)
+        RETURNS double precision
+        LANGUAGE SQL
+        IMMUTABLE
+        AS $$
+          SELECT EXTRACT(EPOCH FROM input_ts) / 86400.0
+        $$;
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE FUNCTION public.date(input_text text)
+        RETURNS date
+        LANGUAGE SQL
+        IMMUTABLE
+        AS $$
+          SELECT CASE
+            WHEN lower(input_text) = 'now' THEN current_date
+            ELSE input_text::date
+          END
+        $$;
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE FUNCTION public.date(input_text text, modifier text)
+        RETURNS date
+        LANGUAGE SQL
+        IMMUTABLE
+        AS $$
+          SELECT (
+            CASE
+              WHEN lower(input_text) = 'now' THEN now()::timestamp
+              ELSE input_text::timestamp
+            END
+            +
+            CASE
+              WHEN modifier IS NULL OR trim(modifier) = '' THEN interval '0 days'
+              ELSE modifier::interval
+            END
+          )::date
+        $$;
+        """
+    )
+    conn.execute(
+        """
         CREATE OR REPLACE FUNCTION public.datetime(input_text text)
         RETURNS timestamp WITHOUT TIME ZONE
         LANGUAGE SQL
