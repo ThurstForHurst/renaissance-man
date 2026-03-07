@@ -188,35 +188,41 @@ def _install_postgres_compat_functions(conn):
     conn.execute(
         """
         CREATE OR REPLACE FUNCTION public.date(input_text text)
-        RETURNS date
+        RETURNS text
         LANGUAGE SQL
         IMMUTABLE
         AS $$
-          SELECT CASE
+          SELECT to_char(
+            CASE
             WHEN lower(input_text) = 'now' THEN current_date
             ELSE input_text::date
-          END
+            END,
+            'YYYY-MM-DD'
+          )
         $$;
         """
     )
     conn.execute(
         """
         CREATE OR REPLACE FUNCTION public.date(input_text text, modifier text)
-        RETURNS date
+        RETURNS text
         LANGUAGE SQL
         IMMUTABLE
         AS $$
-          SELECT (
-            CASE
-              WHEN lower(input_text) = 'now' THEN now()::timestamp
-              ELSE input_text::timestamp
-            END
-            +
-            CASE
-              WHEN modifier IS NULL OR trim(modifier) = '' THEN interval '0 days'
-              ELSE modifier::interval
-            END
-          )::date
+          SELECT to_char(
+            (
+              CASE
+                WHEN lower(input_text) = 'now' THEN now()::timestamp
+                ELSE input_text::timestamp
+              END
+              +
+              CASE
+                WHEN modifier IS NULL OR trim(modifier) = '' THEN interval '0 days'
+                ELSE modifier::interval
+              END
+            )::date,
+            'YYYY-MM-DD'
+          )
         $$;
         """
     )
