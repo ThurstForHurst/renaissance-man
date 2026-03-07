@@ -158,6 +158,15 @@ def _dag_tables_available() -> bool:
 
 
 def _install_postgres_compat_functions(conn):
+    conn.execute("DROP FUNCTION IF EXISTS public.date(text)")
+    conn.execute("DROP FUNCTION IF EXISTS public.date(text,text)")
+    conn.execute("DROP FUNCTION IF EXISTS public.datetime(text)")
+    conn.execute("DROP FUNCTION IF EXISTS public.datetime(timestamp without time zone)")
+    conn.execute("DROP FUNCTION IF EXISTS public.datetime(timestamp with time zone)")
+    conn.execute("DROP FUNCTION IF EXISTS public.strftime(text,text)")
+    conn.execute("DROP FUNCTION IF EXISTS public.julianday(text)")
+    conn.execute("DROP FUNCTION IF EXISTS public.julianday(timestamp without time zone)")
+
     conn.execute(
         """
         CREATE OR REPLACE FUNCTION public.julianday(input_text text)
