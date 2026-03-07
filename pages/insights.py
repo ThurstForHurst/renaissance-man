@@ -11,6 +11,16 @@ from database.db import discover_correlations, get_connection
 
 dash.register_page(__name__)
 
+def _query_dataframe(query: str, params: tuple = ()) -> pd.DataFrame:
+    """Fetch query rows through db wrappers and return a DataFrame."""
+    conn = get_connection()
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([dict(row) for row in rows])
+
+
 def layout():
     return dbc.Container([
         html.Div([
@@ -102,8 +112,6 @@ def discover_patterns(n_clicks):
 )
 def update_correlation_heatmap(n_clicks):
     """Create correlation heatmap."""
-    conn = get_connection()
-    
     # Get data for correlations
     query = """
         SELECT 
@@ -118,9 +126,7 @@ def update_correlation_heatmap(n_clicks):
         WHERE s.date >= date('now', '-30 days')
         ORDER BY s.date DESC
     """
-    
-    df = pd.read_sql_query(query, conn)
-    conn.close()
+    df = _query_dataframe(query)
     
     if len(df) < 5:
         # Not enough data
@@ -306,8 +312,6 @@ def show_personal_bests(n_clicks):
 )
 def update_trends_chart(n_clicks):
     """Show multi-domain trends over time."""
-    conn = get_connection()
-    
     # Get aggregated weekly data
     query = """
         WITH weeks AS (
@@ -327,9 +331,7 @@ def update_trends_chart(n_clicks):
         GROUP BY w.week_start
         ORDER BY w.week_start
     """
-    
-    df = pd.read_sql_query(query, conn)
-    conn.close()
+    df = _query_dataframe(query)
     
     if len(df) < 2:
         fig = go.Figure()

@@ -136,11 +136,11 @@ def check_level_up(domain: str):
     
     return False
 
-def get_level_progress(domain: str) -> dict:
+def get_level_progress(domain: str, levels: list = None) -> dict:
     """
     Get progress toward next level.
     """
-    levels = get_identity_levels()
+    levels = levels if levels is not None else get_identity_levels()
     current = next((l for l in levels if l['domain'] == domain), None)
     
     if not current:
@@ -170,9 +170,10 @@ def get_all_progress() -> dict:
     """
     Get level progress for all domains.
     """
+    levels = get_identity_levels()
     return {
-        'sleep': get_level_progress('sleep'),
-        'health': get_level_progress('health'),
-        'projects': get_level_progress('projects'),
-        'finance': get_level_progress('finance')
+        'sleep': get_level_progress('sleep', levels),
+        'health': get_level_progress('health', levels),
+        'projects': get_level_progress('projects', levels),
+        'finance': get_level_progress('finance', levels)
     }

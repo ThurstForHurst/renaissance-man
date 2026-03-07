@@ -10,7 +10,7 @@ import plotly.graph_objs as go
 from database.db import (
     log_resistance, log_resistance_workout, log_cardio, log_daily_health, get_connection,
     get_exercise_summary, get_health_summary, log_weight, get_brisbane_date,
-    get_weight_trend, get_exercise_trend
+    get_weight_trend, get_exercise_trend, get_recent_daily_health_logs
 )
 from analytics.scoring import award_xp, calculate_resistance_xp, calculate_cardio_xp
 
@@ -215,14 +215,7 @@ def create_exercise_trend_figure(days: int = 30):
 
 def build_recent_diet_entries(limit: int = 5):
     """Render recent diet and macro-tag entries."""
-    conn = get_connection()
-    recent = conn.execute("""
-        SELECT *
-        FROM daily_health_logs
-        ORDER BY date DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
+    recent = get_recent_daily_health_logs(limit)
 
     if not recent:
         return html.Small("No diet entries yet.", className="text-muted")
@@ -369,7 +362,7 @@ def layout():
             html.P("Log training, body metrics, and daily wellness fundamentals.", className="mb-0"),
         ], className="app-page-head"),
         dcc.Store(id='health-refresh-trigger', data=0),
-        html.Div(id='health-summary-row', children=render_health_summary_cards()),
+        html.Div(id='health-summary-row', children=dbc.Spinner(size="sm")),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -517,14 +510,20 @@ def layout():
                         html.Div([
                             html.Hr(className="my-4"),
                             html.H6("Weekly Exercise Snapshot", className="mb-2"),
-                            html.Div(id='health-weekly-snapshot', children=render_weekly_exercise_snapshot_cards()),
+                            html.Div(
+                                id='health-weekly-snapshot',
+                                children=html.Small("Loading snapshot...", className="text-muted")
+                            ),
                             html.Div([
                                 dbc.Badge("150+ min cardio / week", color="light", text_color="dark", className="border"),
                                 dbc.Badge("3+ resistance sessions / week", color="light", text_color="dark", className="border"),
                                 dbc.Badge("Progress > perfect", color="light", text_color="dark", className="border"),
                             ], className="d-flex flex-wrap gap-2 mb-3"),
                             html.H6("Exercise Compass", className="mb-1"),
-                            html.Div(id='recent-exercise-entries', children=build_exercise_compass_panel())
+                            html.Div(
+                                id='recent-exercise-entries',
+                                children=html.Small("Loading exercise compass...", className="text-muted")
+                            )
                         ], className="health-insight-strip")
                     ])
                 ], className="shadow-sm border-0 health-panel health-log-card")
@@ -673,7 +672,7 @@ def layout():
                         html.Small("Stacked reps by movement + cardio line", className="text-muted")
                     ], className="bg-white"),
                     dbc.CardBody([
-                        dcc.Graph(id='exercise-trends-chart', figure=create_exercise_trend_figure(30))
+                        dcc.Graph(id='exercise-trends-chart', figure=go.Figure())
                     ])
                 ], className="shadow-sm border-0 health-panel")
             ], md=6),
@@ -684,7 +683,7 @@ def layout():
                         html.Small("Daily bodyweight trend", className="text-muted")
                     ], className="bg-white"),
                     dbc.CardBody([
-                        dcc.Graph(id='weight-trend-chart', figure=create_weight_trend_figure(90))
+                        dcc.Graph(id='weight-trend-chart', figure=go.Figure())
                     ])
                 ], className="shadow-sm border-0 health-panel")
             ], md=6),
@@ -959,7 +958,7 @@ def log_weight_entry(n_clicks, date_val, weight_val, notes, refresh_count):
     Output('exercise-trends-chart', 'figure'),
     Output('recent-exercise-entries', 'children'),
     Input('health-refresh-trigger', 'data'),
-    prevent_initial_call=True
+    prevent_initial_call=False
 )
 def refresh_health_reporting(_refresh):
     """Refresh summary and trend charts after new logs."""

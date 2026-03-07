@@ -4,11 +4,13 @@ import json
 import math
 import uuid
 import re
+import copy
 import sqlite3
+import threading
 from pathlib import Path
 from collections import defaultdict, deque
 from datetime import datetime, date, time, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Tuple
 import pandas as pd
 from config import (
     NEAR_MISS_THRESHOLD,
@@ -21,14 +23,18 @@ from config import (
 
 try:
     import psycopg2
+    from psycopg2 import pool as psycopg2_pool
     from psycopg2.extras import RealDictCursor
 except Exception:  # pragma: no cover - optional dependency for Postgres deployments
     psycopg2 = None
+    psycopg2_pool = None
     RealDictCursor = None
 
 DB_PATH = os.getenv('DATABASE_PATH', 'data/dashboard.db')
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
+POSTGRES_BOOTSTRAP_VERSION = "2026-03-08-perf-v1"
+POSTGRES_BOOTSTRAP_KEY = "postgres_bootstrap_version"
 DOMAIN_XP_PER_LEVEL = 500
 GLOBAL_XP_PER_LEVEL = 2000
 DAG_DEFAULT_USER_ID = 'default'
@@ -47,6 +53,80 @@ RENAISSANCE_THRESHOLDS = {
     "marathon_compete_time_seconds": 16200,
 }
 
+_PG_POOL = None
+_PG_POOL_LOCK = threading.Lock()
+_READ_CACHE_LOCK = threading.Lock()
+_READ_CACHE: Dict[Tuple[Any, ...], Tuple[int, Any]] = {}
+_READ_CACHE_VERSION = 0
+
+
+def _clone_cached_value(value: Any) -> Any:
+    if isinstance(value, pd.DataFrame):
+        return value.copy(deep=True)
+    if isinstance(value, (dict, list, tuple, set)):
+        return copy.deepcopy(value)
+    return value
+
+
+def _invalidate_cached_reads():
+    global _READ_CACHE_VERSION
+    with _READ_CACHE_LOCK:
+        _READ_CACHE_VERSION += 1
+        _READ_CACHE.clear()
+
+
+def _cached_read(key: Tuple[Any, ...], loader: Callable[[], Any]) -> Any:
+    with _READ_CACHE_LOCK:
+        cached = _READ_CACHE.get(key)
+        if cached and cached[0] == _READ_CACHE_VERSION:
+            return _clone_cached_value(cached[1])
+    value = loader()
+    with _READ_CACHE_LOCK:
+        _READ_CACHE[key] = (_READ_CACHE_VERSION, _clone_cached_value(value))
+    return _clone_cached_value(value)
+
+
+def _is_mutating_sql(query: str) -> bool:
+    token = (query or "").lstrip().split(None, 1)
+    if not token:
+        return False
+    first = token[0].upper()
+    return first in {
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "TRUNCATE",
+        "REINDEX",
+        "VACUUM",
+        "ANALYZE",
+        "GRANT",
+        "REVOKE",
+    }
+
+
+def _get_postgres_pool():
+    global _PG_POOL
+    if psycopg2_pool is None:
+        raise RuntimeError("DATABASE_URL is set but psycopg2 pool is unavailable")
+    if _PG_POOL is not None:
+        return _PG_POOL
+    with _PG_POOL_LOCK:
+        if _PG_POOL is None:
+            min_conn = max(1, int(os.getenv("PG_POOL_MIN_CONN", "1")))
+            default_max = max(4, int(os.getenv("WEB_CONCURRENCY", "1")) * 4)
+            max_conn = max(min_conn, int(os.getenv("PG_POOL_MAX_CONN", str(default_max))))
+            _PG_POOL = psycopg2_pool.ThreadedConnectionPool(
+                min_conn,
+                max_conn,
+                DATABASE_URL,
+                connect_timeout=int(os.getenv("PG_CONNECT_TIMEOUT", "10")),
+                application_name="renaissance-man",
+            )
+    return _PG_POOL
+
 
 def _adapt_query_for_postgres(query: str) -> str:
     q = query
@@ -64,10 +144,20 @@ class _PostgresCursor:
         self._cursor = cursor
 
     def fetchone(self):
-        return self._cursor.fetchone()
+        row = self._cursor.fetchone()
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+        return row
 
     def fetchall(self):
-        return self._cursor.fetchall()
+        rows = self._cursor.fetchall()
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+        return rows
 
     @property
     def lastrowid(self):
@@ -87,8 +177,11 @@ class _PostgresCursor:
 
 
 class _PostgresConnection:
-    def __init__(self, dsn: str):
-        self._conn = psycopg2.connect(dsn)
+    def __init__(self):
+        self._pool = _get_postgres_pool()
+        self._conn = self._pool.getconn()
+        self._closed = False
+        self._has_pending_write = False
 
     def cursor(self, *args, **kwargs):
         return self._conn.cursor(*args, **kwargs)
@@ -101,6 +194,16 @@ class _PostgresConnection:
         else:
             pg_query = _adapt_query_for_postgres(query)
             cur.execute(pg_query, params)
+        first = (query or "").lstrip().split(None, 1)
+        command = first[0].upper() if first else ""
+        if command == "COMMIT":
+            if self._has_pending_write:
+                _invalidate_cached_reads()
+            self._has_pending_write = False
+        elif command == "ROLLBACK":
+            self._has_pending_write = False
+        elif _is_mutating_sql(query):
+            self._has_pending_write = True
         return _PostgresCursor(cur)
 
     def executescript(self, script: str):
@@ -112,9 +215,68 @@ class _PostgresConnection:
 
     def commit(self):
         self._conn.commit()
+        if self._has_pending_write:
+            _invalidate_cached_reads()
+        self._has_pending_write = False
 
     def rollback(self):
         self._conn.rollback()
+        self._has_pending_write = False
+
+    def close(self):
+        if self._closed:
+            return
+        try:
+            # Avoid returning connections with open transactions to the pool.
+            self._conn.rollback()
+        except Exception:
+            pass
+        self._pool.putconn(self._conn)
+        self._closed = True
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _SQLiteConnection:
+    def __init__(self, db_path: Path):
+        db_path.parent.mkdir(exist_ok=True)
+        self._conn = sqlite3.connect(db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._has_pending_write = False
+
+    def execute(self, query: str, params=None):
+        if params is None:
+            cur = self._conn.execute(query)
+        else:
+            cur = self._conn.execute(query, params)
+        first = (query or "").lstrip().split(None, 1)
+        command = first[0].upper() if first else ""
+        if command == "COMMIT":
+            if self._has_pending_write:
+                _invalidate_cached_reads()
+            self._has_pending_write = False
+        elif command == "ROLLBACK":
+            self._has_pending_write = False
+        elif _is_mutating_sql(query):
+            self._has_pending_write = True
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+        if self._has_pending_write:
+            _invalidate_cached_reads()
+        self._has_pending_write = False
+
+    def rollback(self):
+        self._conn.rollback()
+        self._has_pending_write = False
 
     def close(self):
         self._conn.close()
@@ -128,13 +290,9 @@ def get_connection():
     if USE_POSTGRES:
         if psycopg2 is None:
             raise RuntimeError("DATABASE_URL is set but psycopg2 is not installed")
-        return _PostgresConnection(DATABASE_URL)
+        return _PostgresConnection()
 
-    db_path = Path(DB_PATH)
-    db_path.parent.mkdir(exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row  # Enable column access by name
-    return conn
+    return _SQLiteConnection(Path(DB_PATH))
 
 
 def _dag_tables_available() -> bool:
@@ -155,6 +313,64 @@ def _dag_tables_available() -> bool:
         ).fetchall()
     conn.close()
     return len(rows) == 4
+
+
+def _query_dataframe(query: str, params: Optional[tuple] = None) -> pd.DataFrame:
+    conn = get_connection()
+    rows = conn.execute(query, params or ()).fetchall()
+    conn.close()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([dict(row) for row in rows])
+
+
+def _ensure_postgres_performance_indexes(conn):
+    index_sql = [
+        "CREATE INDEX IF NOT EXISTS idx_sleep_logs_date ON sleep_logs(date)",
+        "CREATE INDEX IF NOT EXISTS idx_weight_logs_date ON weight_logs(date)",
+        "CREATE INDEX IF NOT EXISTS idx_exercise_resistance_date ON exercise_resistance(date)",
+        "CREATE INDEX IF NOT EXISTS idx_exercise_cardio_date ON exercise_cardio(date)",
+        "CREATE INDEX IF NOT EXISTS idx_project_sessions_date ON project_sessions(date)",
+        "CREATE INDEX IF NOT EXISTS idx_project_sessions_project_date ON project_sessions(project_id, date)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_status_tier_touched ON projects(status, tier, last_touched)",
+        "CREATE INDEX IF NOT EXISTS idx_xp_logs_domain_activity ON xp_logs(domain, activity)",
+        "CREATE INDEX IF NOT EXISTS idx_xp_logs_date ON xp_logs(date)",
+        "CREATE INDEX IF NOT EXISTS idx_weekly_finance_week_end ON weekly_finance(week_end_date)",
+        "CREATE INDEX IF NOT EXISTS idx_daily_quests_date_completed ON daily_quests(date, completed)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_completed_order ON tasks(completed, order_index)",
+    ]
+    for stmt in index_sql:
+        conn.execute(stmt)
+
+
+def _bootstrap_postgres_if_needed(conn) -> bool:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = ?",
+        (POSTGRES_BOOTSTRAP_KEY,),
+    ).fetchone()
+    current = row["value"] if row else None
+    if current == POSTGRES_BOOTSTRAP_VERSION:
+        return False
+
+    _install_postgres_compat_functions(conn)
+    _ensure_postgres_performance_indexes(conn)
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        (POSTGRES_BOOTSTRAP_KEY, POSTGRES_BOOTSTRAP_VERSION),
+    )
+    return True
 
 
 def _install_postgres_compat_functions(conn):
@@ -293,7 +509,7 @@ def init_db():
     """Initialize database with schema."""
     if USE_POSTGRES:
         conn = get_connection()
-        _install_postgres_compat_functions(conn)
+        bootstrap_updated = _bootstrap_postgres_if_needed(conn)
         _ensure_identity_level_integrity(conn)
         _deactivate_orphan_routine_items(conn)
         conn.execute(
@@ -305,7 +521,8 @@ def init_db():
         )
         conn.commit()
         conn.close()
-        recalculate_identity_levels_from_logs()
+        if bootstrap_updated and os.getenv("RECALCULATE_IDENTITY_ON_BOOT", "0") == "1":
+            recalculate_identity_levels_from_logs()
         print("Postgres database initialized from existing schema")
         return
 
@@ -605,14 +822,19 @@ def log_sleep(date: str, bedtime: str, wake_time: str, wake_mood: int,
 
 def get_sleep_logs(days: int = 30) -> pd.DataFrame:
     """Get recent sleep logs."""
-    conn = get_connection()
-    df = pd.read_sql_query(f"""
-        SELECT * FROM sleep_logs 
-        ORDER BY date DESC 
-        LIMIT {days}
-    """, conn)
-    conn.close()
-    return df
+    key = ("get_sleep_logs", int(days))
+    return _cached_read(
+        key,
+        lambda: _query_dataframe(
+            """
+            SELECT *
+            FROM sleep_logs
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (int(days),),
+        ),
+    )
 
 def get_sleep_score(date: str) -> Dict[str, float]:
     """Calculate sleep score for a given date."""
@@ -798,32 +1020,38 @@ def log_cardio(date: str, type: str, duration_min: int, distance_km: float = Non
 
 def get_exercise_summary(days: int = 7, reference_date: Optional[str] = None) -> Dict[str, Any]:
     """Get exercise summary for last N days."""
-    conn = get_connection()
     base_date = date.fromisoformat(reference_date or get_brisbane_date())
+    days = int(days)
     cutoff = (base_date - timedelta(days=days)).isoformat()
-    
-    # Resistance summary
-    resistance = conn.execute("""
-        SELECT exercise_type, SUM(reps * sets) as total_reps
-        FROM exercise_resistance
-        WHERE date >= ?
-        GROUP BY exercise_type
-    """, (cutoff,)).fetchall()
-    
-    # Cardio summary
-    cardio = conn.execute("""
-        SELECT SUM(duration_min) as total_minutes, SUM(distance_km) as total_distance
-        FROM exercise_cardio
-        WHERE date >= ?
-    """, (cutoff,)).fetchone()
-    
-    conn.close()
-    
-    return {
-        'resistance': {row['exercise_type']: row['total_reps'] for row in resistance},
-        'cardio_minutes': cardio['total_minutes'] or 0,
-        'cardio_distance': cardio['total_distance'] or 0
-    }
+    key = ("get_exercise_summary", days, cutoff)
+
+    def _load():
+        conn = get_connection()
+        resistance = conn.execute(
+            """
+            SELECT exercise_type, SUM(reps * sets) as total_reps
+            FROM exercise_resistance
+            WHERE date >= ?
+            GROUP BY exercise_type
+            """,
+            (cutoff,),
+        ).fetchall()
+        cardio = conn.execute(
+            """
+            SELECT SUM(duration_min) as total_minutes, SUM(distance_km) as total_distance
+            FROM exercise_cardio
+            WHERE date >= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        conn.close()
+        return {
+            'resistance': {row['exercise_type']: row['total_reps'] for row in resistance},
+            'cardio_minutes': cardio['total_minutes'] or 0,
+            'cardio_distance': cardio['total_distance'] or 0
+        }
+
+    return _cached_read(key, _load)
 
 def log_weight(date: str, weight_kg: float, notes: str = ""):
     """Log weight measurement."""
@@ -862,14 +1090,19 @@ def get_latest_weight_entry() -> Optional[Dict[str, Any]]:
 
 def get_weight_logs(days: int = 30) -> pd.DataFrame:
     """Get recent weight logs."""
-    conn = get_connection()
-    df = pd.read_sql_query(f"""
-        SELECT * FROM weight_logs 
-        ORDER BY date DESC 
-        LIMIT {days}
-    """, conn)
-    conn.close()
-    return df
+    key = ("get_weight_logs", int(days))
+    return _cached_read(
+        key,
+        lambda: _query_dataframe(
+            """
+            SELECT *
+            FROM weight_logs
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (int(days),),
+        ),
+    )
 
 
 def log_daily_health(date: str, steps: int = None, calories: int = None,
@@ -908,96 +1141,125 @@ def log_daily_health(date: str, steps: int = None, calories: int = None,
 
 def get_health_summary(reference_date: Optional[str] = None) -> dict:
     """Get health summary metrics."""
-    conn = get_connection()
     base_date = date.fromisoformat(reference_date or get_brisbane_date())
     cutoff = (base_date - timedelta(days=7)).isoformat()
-    
-    # Latest weight (from weight_logs table - already exists)
-    latest_weight = conn.execute("""
-        SELECT weight_kg, date
-        FROM weight_logs
-        ORDER BY date DESC LIMIT 1
-    """).fetchone()
-    
-    # Average calories last 7 days
-    avg_calories = conn.execute("""
-        SELECT AVG(calories) as avg_cal
-        FROM daily_health_logs
-        WHERE date >= ?
-        AND calories IS NOT NULL
-    """, (cutoff,)).fetchone()
-    
-    conn.close()
-    
-    return {
-        'latest_weight': latest_weight['weight_kg'] if latest_weight else None,
-        'latest_weight_date': latest_weight['date'] if latest_weight else None,
-        'avg_calories': avg_calories['avg_cal'] if avg_calories and avg_calories['avg_cal'] else 0
-    }
+    key = ("get_health_summary", cutoff)
+
+    def _load():
+        conn = get_connection()
+        latest_weight = conn.execute(
+            """
+            SELECT weight_kg, date
+            FROM weight_logs
+            ORDER BY date DESC LIMIT 1
+            """
+        ).fetchone()
+        avg_calories = conn.execute(
+            """
+            SELECT AVG(calories) as avg_cal
+            FROM daily_health_logs
+            WHERE date >= ?
+              AND calories IS NOT NULL
+            """,
+            (cutoff,),
+        ).fetchone()
+        conn.close()
+        return {
+            'latest_weight': latest_weight['weight_kg'] if latest_weight else None,
+            'latest_weight_date': latest_weight['date'] if latest_weight else None,
+            'avg_calories': avg_calories['avg_cal'] if avg_calories and avg_calories['avg_cal'] else 0
+        }
+
+    return _cached_read(key, _load)
+
+
+def get_recent_daily_health_logs(limit: int = 5) -> List[Dict[str, Any]]:
+    """Get recent daily health entries ordered newest-first."""
+    limit = int(limit)
+    key = ("get_recent_daily_health_logs", limit)
+
+    def _load():
+        conn = get_connection()
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM daily_health_logs
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    return _cached_read(key, _load)
+
 
 def get_weight_trend(days: int = 90, reference_date: Optional[str] = None) -> pd.DataFrame:
     """Get recent daily weight values ordered ascending for charting."""
-    conn = get_connection()
     base_date = date.fromisoformat(reference_date or get_brisbane_date())
+    days = int(days)
     cutoff = (base_date - timedelta(days=days - 1)).isoformat()
-    df = pd.read_sql_query(
-        """
-        SELECT date, weight_kg
-        FROM weight_logs
-        WHERE date >= ?
-        ORDER BY date ASC
-        """,
-        conn,
-        params=(cutoff,),
+    key = ("get_weight_trend", days, cutoff)
+    return _cached_read(
+        key,
+        lambda: _query_dataframe(
+            """
+            SELECT date, weight_kg
+            FROM weight_logs
+            WHERE date >= ?
+            ORDER BY date ASC
+            """,
+            (cutoff,),
+        ),
     )
-    conn.close()
-    return df
 
 def get_exercise_trend(days: int = 30, reference_date: Optional[str] = None) -> pd.DataFrame:
     """Get daily resistance reps by type with cardio minutes for charting."""
-    conn = get_connection()
     base_date = date.fromisoformat(reference_date or get_brisbane_date())
+    days = int(days)
     cutoff = (base_date - timedelta(days=days - 1)).isoformat()
-    df = pd.read_sql_query(
-        """
-        WITH daily_res AS (
-            SELECT date, exercise_type, SUM(reps * sets) AS total_reps
-            FROM exercise_resistance
-            WHERE date >= ?
-            GROUP BY date, exercise_type
+    key = ("get_exercise_trend", days, cutoff)
+    return _cached_read(
+        key,
+        lambda: _query_dataframe(
+            """
+            WITH daily_res AS (
+                SELECT date, exercise_type, SUM(reps * sets) AS total_reps
+                FROM exercise_resistance
+                WHERE date >= ?
+                GROUP BY date, exercise_type
+            ),
+            daily_cardio AS (
+                SELECT date, SUM(duration_min) AS cardio_min
+                FROM exercise_cardio
+                WHERE date >= ?
+                GROUP BY date
+            )
+            SELECT
+                r.date,
+                r.exercise_type,
+                r.total_reps,
+                COALESCE(c.cardio_min, 0) AS cardio_min
+            FROM daily_res r
+            LEFT JOIN daily_cardio c ON c.date = r.date
+            UNION ALL
+            SELECT
+                c.date,
+                NULL AS exercise_type,
+                0 AS total_reps,
+                c.cardio_min
+            FROM daily_cardio c
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM daily_res r2
+                WHERE r2.date = c.date
+            )
+            ORDER BY date ASC
+            """,
+            (cutoff, cutoff),
         ),
-        daily_cardio AS (
-            SELECT date, SUM(duration_min) AS cardio_min
-            FROM exercise_cardio
-            WHERE date >= ?
-            GROUP BY date
-        )
-        SELECT
-            r.date,
-            r.exercise_type,
-            r.total_reps,
-            COALESCE(c.cardio_min, 0) AS cardio_min
-        FROM daily_res r
-        LEFT JOIN daily_cardio c ON c.date = r.date
-        UNION ALL
-        SELECT
-            c.date,
-            NULL AS exercise_type,
-            0 AS total_reps,
-            c.cardio_min
-        FROM daily_cardio c
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM daily_res r2
-            WHERE r2.date = c.date
-        )
-        ORDER BY date ASC
-        """,
-        conn,
-        params=(cutoff, cutoff),
     )
-    conn.close()
-    return df
 
 # ============================================================================
 # JOURNAL OPERATIONS
@@ -1236,74 +1498,91 @@ def archive_project(project_id: int):
 
 def get_active_projects() -> List[Dict]:
     """Get all active projects with session counts, grouped by tier."""
-    conn = get_connection()
-    projects = conn.execute("""
-        SELECT p.*, 
-               COUNT(s.id) as session_count,
-               SUM(s.duration_min) as total_minutes,
-               julianday('now') - julianday(p.last_touched) as days_since_touched
-        FROM projects p
-        LEFT JOIN project_sessions s ON p.id = s.project_id
-        WHERE p.status = 'active'
-        GROUP BY p.id
-        ORDER BY p.tier, p.last_touched DESC
-    """).fetchall()
-    conn.close()
-    
-    return [dict(row) for row in projects]
+    key = ("get_active_projects",)
+
+    def _load():
+        conn = get_connection()
+        projects = conn.execute(
+            """
+            SELECT p.*, 
+                   COUNT(s.id) as session_count,
+                   SUM(s.duration_min) as total_minutes,
+                   julianday('now') - julianday(p.last_touched) as days_since_touched
+            FROM projects p
+            LEFT JOIN project_sessions s ON p.id = s.project_id
+            WHERE p.status = 'active'
+            GROUP BY p.id
+            ORDER BY p.tier, p.last_touched DESC
+            """
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in projects]
+
+    return _cached_read(key, _load)
 
 def get_project_summary() -> Dict[str, Any]:
     """Get summary stats for projects."""
-    conn = get_connection()
-    
-    # Count active projects
-    active_count = conn.execute("""
-        SELECT COUNT(*) as count FROM projects WHERE status = 'active'
-    """).fetchone()
-    
-    # Time this week (Monday to today)
     from datetime import date, timedelta
     today = date.today()
     monday = today - timedelta(days=today.weekday())
     week_start = monday.isoformat()
-    
-    time_this_week = conn.execute("""
-        SELECT SUM(duration_min) as total
-        FROM project_sessions
-        WHERE date >= ?
-    """, (week_start,)).fetchone()
-    
-    # Projects touched this week
-    touched_this_week = conn.execute("""
-        SELECT COUNT(DISTINCT project_id) as count
-        FROM project_sessions
-        WHERE date >= ?
-    """, (week_start,)).fetchone()
-    
-    # Tier 1 projects count
-    tier1_count = conn.execute("""
-        SELECT COUNT(*) as count FROM projects 
-        WHERE status = 'active' AND tier = 1
-    """).fetchone()
-    
-    conn.close()
-    
-    return {
-        'active_projects': active_count['count'],
-        'time_this_week': time_this_week['total'] or 0,
-        'touched_this_week': touched_this_week['count'],
-        'tier1_projects': tier1_count['count']
-    }
+    key = ("get_project_summary", week_start)
+
+    def _load():
+        conn = get_connection()
+        active_count = conn.execute(
+            "SELECT COUNT(*) as count FROM projects WHERE status = 'active'"
+        ).fetchone()
+        time_this_week = conn.execute(
+            """
+            SELECT SUM(duration_min) as total
+            FROM project_sessions
+            WHERE date >= ?
+            """,
+            (week_start,),
+        ).fetchone()
+        touched_this_week = conn.execute(
+            """
+            SELECT COUNT(DISTINCT project_id) as count
+            FROM project_sessions
+            WHERE date >= ?
+            """,
+            (week_start,),
+        ).fetchone()
+        tier1_count = conn.execute(
+            """
+            SELECT COUNT(*) as count
+            FROM projects
+            WHERE status = 'active' AND tier = 1
+            """
+        ).fetchone()
+        conn.close()
+        return {
+            'active_projects': active_count['count'],
+            'time_this_week': time_this_week['total'] or 0,
+            'touched_this_week': touched_this_week['count'],
+            'tier1_projects': tier1_count['count']
+        }
+
+    return _cached_read(key, _load)
 
 def get_all_tasks() -> List[Dict]:
     """Get all tasks ordered by index."""
-    conn = get_connection()
-    tasks = conn.execute("""
-        SELECT * FROM tasks 
-        ORDER BY completed, order_index
-    """).fetchall()
-    conn.close()
-    return [dict(row) for row in tasks]
+    key = ("get_all_tasks",)
+
+    def _load():
+        conn = get_connection()
+        tasks = conn.execute(
+            """
+            SELECT *
+            FROM tasks
+            ORDER BY completed, order_index
+            """
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in tasks]
+
+    return _cached_read(key, _load)
 
 def add_task(text: str) -> int:
     """Add a new task."""
@@ -1523,48 +1802,57 @@ def get_finance_summary(reference_date: Optional[str] = None) -> Dict[str, Any]:
     Backward-compatible finance summary for pages that still use legacy keys.
     Values are now derived from weekly_finance.
     """
-    conn = get_connection()
     base_date = date.fromisoformat(reference_date or get_brisbane_date())
     cutoff_3mo = (base_date - timedelta(days=90)).isoformat()
-    recent = conn.execute("""
-        SELECT income, savings
-        FROM weekly_finance
-        ORDER BY week_end_date DESC
-        LIMIT 1
-    """).fetchone()
+    key = ("get_finance_summary", cutoff_3mo)
 
-    avg = conn.execute("""
-        SELECT AVG(savings) AS avg_savings
-        FROM (
-            SELECT savings
+    def _load():
+        conn = get_connection()
+        recent = conn.execute(
+            """
+            SELECT income, savings
             FROM weekly_finance
             ORDER BY week_end_date DESC
-            LIMIT 4
-        )
-    """).fetchone()
+            LIMIT 1
+            """
+        ).fetchone()
+        avg = conn.execute(
+            """
+            SELECT AVG(savings) AS avg_savings
+            FROM (
+                SELECT savings
+                FROM weekly_finance
+                ORDER BY week_end_date DESC
+                LIMIT 4
+            )
+            """
+        ).fetchone()
+        total_3mo = conn.execute(
+            """
+            SELECT SUM(savings) AS total_savings
+            FROM weekly_finance
+            WHERE week_end_date >= ?
+            """,
+            (cutoff_3mo,),
+        ).fetchone()
+        conn.close()
 
-    total_3mo = conn.execute("""
-        SELECT SUM(savings) AS total_savings
-        FROM weekly_finance
-        WHERE week_end_date >= ?
-    """, (cutoff_3mo,)).fetchone()
-    conn.close()
-
-    if not recent:
+        if not recent:
+            return {
+                'savings_rate': 0,
+                'avg_savings': 0,
+                'total_savings_3mo': 0,
+                'non_salary_income_3mo': 0
+            }
+        savings_rate = (recent['savings'] / recent['income'] * 100) if recent['income'] else 0
         return {
-            'savings_rate': 0,
-            'avg_savings': 0,
-            'total_savings_3mo': 0,
+            'savings_rate': round(savings_rate, 1),
+            'avg_savings': round(avg['avg_savings'] or 0, 2),
+            'total_savings_3mo': round(total_3mo['total_savings'] or 0, 2),
             'non_salary_income_3mo': 0
         }
 
-    savings_rate = (recent['savings'] / recent['income'] * 100) if recent['income'] else 0
-    return {
-        'savings_rate': round(savings_rate, 1),
-        'avg_savings': round(avg['avg_savings'] or 0, 2),
-        'total_savings_3mo': round(total_3mo['total_savings'] or 0, 2),
-        'non_salary_income_3mo': 0
-    }
+    return _cached_read(key, _load)
 
 def add_asset(name: str, category: str, current_value: float, date_updated: str, notes: str = ""):
     """Add or update an asset."""
@@ -1644,26 +1932,22 @@ def get_all_liabilities() -> List[Dict]:
 
 def get_net_worth() -> Dict[str, float]:
     """Calculate current net worth."""
-    conn = get_connection()
-    
-    total_assets = conn.execute("""
-        SELECT SUM(current_value) as total FROM assets
-    """).fetchone()
-    
-    total_liabilities = conn.execute("""
-        SELECT SUM(current_value) as total FROM liabilities
-    """).fetchone()
-    
-    conn.close()
-    
-    assets = total_assets['total'] or 0
-    liabilities = total_liabilities['total'] or 0
-    
-    return {
-        'total_assets': assets,
-        'total_liabilities': liabilities,
-        'net_worth': assets - liabilities
-    }
+    key = ("get_net_worth",)
+
+    def _load():
+        conn = get_connection()
+        total_assets = conn.execute("SELECT SUM(current_value) as total FROM assets").fetchone()
+        total_liabilities = conn.execute("SELECT SUM(current_value) as total FROM liabilities").fetchone()
+        conn.close()
+        assets = total_assets['total'] or 0
+        liabilities = total_liabilities['total'] or 0
+        return {
+            'total_assets': assets,
+            'total_liabilities': liabilities,
+            'net_worth': assets - liabilities
+        }
+
+    return _cached_read(key, _load)
 
 
 # ============================================================================
@@ -1694,10 +1978,14 @@ def log_xp(date: str, domain: str, activity: str, xp_gained: int,
 
 def get_identity_levels() -> List[Dict]:
     """Get current identity levels for all domains."""
-    conn = get_connection()
-    levels = conn.execute("SELECT * FROM identity_levels ORDER BY domain").fetchall()
-    conn.close()
-    return [dict(row) for row in levels]
+    key = ("get_identity_levels",)
+    def _load():
+        conn = get_connection()
+        levels = conn.execute("SELECT * FROM identity_levels ORDER BY domain").fetchall()
+        conn.close()
+        return [dict(row) for row in levels]
+
+    return _cached_read(key, _load)
 
 def update_identity_level(domain: str, new_level: int, new_name: str):
     """Update identity level when threshold is reached."""
@@ -1712,79 +2000,78 @@ def update_identity_level(domain: str, new_level: int, new_name: str):
 
 def get_overall_level() -> Dict[str, Any]:
     """Get overall level across all domains."""
-    conn = get_connection()
-    
-    # Get total XP across all domains
-    total_xp = conn.execute("""
-        SELECT SUM(domain_xp) as total
-        FROM (
-            SELECT domain, MAX(xp) AS domain_xp
-            FROM identity_levels
-            GROUP BY domain
-        )
-    """).fetchone()
-    
-    conn.close()
-    
-    total = total_xp['total'] or 0
-    
-    level = (total // GLOBAL_XP_PER_LEVEL) + 1
-    xp_in_level = total % GLOBAL_XP_PER_LEVEL
-    xp_needed = GLOBAL_XP_PER_LEVEL
-    percentage = (xp_in_level / xp_needed * 100) if xp_needed > 0 else 0
+    key = ("get_overall_level",)
 
-    # Milestones:
-    # - Levels 10..90 (every 10): $100
-    # - Levels 100, 200, 300...: $500
-    reached_500_count = level // 100
-    reached_100_count = min(level // 10, 9)
-    total_rewards_value = reached_100_count * 100 + reached_500_count * 500
+    def _load():
+        conn = get_connection()
+        total_xp = conn.execute(
+            """
+            SELECT SUM(domain_xp) as total
+            FROM (
+                SELECT domain, MAX(xp) AS domain_xp
+                FROM identity_levels
+                GROUP BY domain
+            )
+            """
+        ).fetchone()
+        conn.close()
 
-    if level < 10:
-        next_milestone_level = 10
-    elif level < 90:
-        next_milestone_level = ((level // 10) + 1) * 10
-    elif level < 100:
-        next_milestone_level = 100
-    else:
-        next_milestone_level = ((level // 100) + 1) * 100
+        total = total_xp['total'] or 0
+        level = (total // GLOBAL_XP_PER_LEVEL) + 1
+        xp_in_level = total % GLOBAL_XP_PER_LEVEL
+        xp_needed = GLOBAL_XP_PER_LEVEL
+        percentage = (xp_in_level / xp_needed * 100) if xp_needed > 0 else 0
 
-    next_milestone_reward = 500 if next_milestone_level % 100 == 0 else 100
-    xp_to_next_milestone = max(0, (next_milestone_level - level) * GLOBAL_XP_PER_LEVEL - xp_in_level)
+        reached_500_count = level // 100
+        reached_100_count = min(level // 10, 9)
+        total_rewards_value = reached_100_count * 100 + reached_500_count * 500
 
-    # Last milestone reached for display
-    if level >= 100:
-        last_milestone_level = (level // 100) * 100
-        last_milestone_reward = 500
-    elif level >= 10:
-        last_milestone_level = (level // 10) * 10
-        last_milestone_reward = 100
-    else:
-        last_milestone_level = None
-        last_milestone_reward = None
+        if level < 10:
+            next_milestone_level = 10
+        elif level < 90:
+            next_milestone_level = ((level // 10) + 1) * 10
+        elif level < 100:
+            next_milestone_level = 100
+        else:
+            next_milestone_level = ((level // 100) + 1) * 100
 
-    return {
-        'level': level,
-        'name': f"Level {level}",
-        'total_xp': total,
-        'current_threshold': total - xp_in_level,
-        'next_threshold': xp_needed,
-        'next_level': level + 1,
-        'xp_in_level': xp_in_level,
-        'xp_per_level': GLOBAL_XP_PER_LEVEL,
-        'percentage': percentage,
-        'max_level': False,
-        'milestones': {
-            'last_level': last_milestone_level,
-            'last_reward': last_milestone_reward,
-            'next_level': next_milestone_level,
-            'next_reward': next_milestone_reward,
-            'xp_to_next': xp_to_next_milestone,
-            'count_100': reached_100_count,
-            'count_500': reached_500_count,
-            'total_rewards_value': total_rewards_value
+        next_milestone_reward = 500 if next_milestone_level % 100 == 0 else 100
+        xp_to_next_milestone = max(0, (next_milestone_level - level) * GLOBAL_XP_PER_LEVEL - xp_in_level)
+
+        if level >= 100:
+            last_milestone_level = (level // 100) * 100
+            last_milestone_reward = 500
+        elif level >= 10:
+            last_milestone_level = (level // 10) * 10
+            last_milestone_reward = 100
+        else:
+            last_milestone_level = None
+            last_milestone_reward = None
+
+        return {
+            'level': level,
+            'name': f"Level {level}",
+            'total_xp': total,
+            'current_threshold': total - xp_in_level,
+            'next_threshold': xp_needed,
+            'next_level': level + 1,
+            'xp_in_level': xp_in_level,
+            'xp_per_level': GLOBAL_XP_PER_LEVEL,
+            'percentage': percentage,
+            'max_level': False,
+            'milestones': {
+                'last_level': last_milestone_level,
+                'last_reward': last_milestone_reward,
+                'next_level': next_milestone_level,
+                'next_reward': next_milestone_reward,
+                'xp_to_next': xp_to_next_milestone,
+                'count_100': reached_100_count,
+                'count_500': reached_500_count,
+                'total_rewards_value': total_rewards_value
+            }
         }
-    }
+
+    return _cached_read(key, _load)
 
 # ============================================================================
 # QUEST OPERATIONS
@@ -1854,14 +2141,22 @@ def generate_daily_quests(date: str) -> List[Dict]:
 
 def get_daily_quests(date: str) -> List[Dict]:
     """Get quests for a specific date."""
-    conn = get_connection()
-    result = conn.execute("""
-        SELECT * FROM daily_quests
-        WHERE date = ?
-        ORDER BY id
-    """, (date,)).fetchall()
-    conn.close()
-    return [dict(row) for row in result]
+    key = ("get_daily_quests", date)
+
+    def _load():
+        conn = get_connection()
+        result = conn.execute(
+            """
+            SELECT * FROM daily_quests
+            WHERE date = ?
+            ORDER BY id
+            """,
+            (date,),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in result]
+
+    return _cached_read(key, _load)
 
 def _quest_domain(quest_type: str) -> str:
     """Map quest type to XP domain."""
@@ -2005,30 +2300,24 @@ def uncomplete_quest(quest_id: int):
 
 def discover_correlations() -> List[Dict]:
     """Discover correlations between different metrics."""
-    conn = get_connection()
-    
-    # Get sleep and exercise data
-    query = """
-        SELECT 
-            s.date,
-            s.duration_minutes,
-            s.energy,
-            s.sleep_quality,
-            (SELECT SUM(duration_min) FROM exercise_cardio e WHERE e.date = s.date) as cardio_min,
-            (SELECT SUM(reps * sets) FROM exercise_resistance r WHERE r.date = s.date AND r.exercise_type = 'pushups') as pushups
-        FROM sleep_logs s
-        WHERE s.date >= date('now', '-30 days')
-        ORDER BY s.date DESC
-    """
-    
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    
-    patterns = []
-    
-    if len(df) > 10:
-        # Calculate correlation: exercise vs sleep quality
-        if df['cardio_min'].notna().sum() > 5:
+    key = ("discover_correlations",)
+
+    def _load():
+        query = """
+            SELECT 
+                s.date,
+                s.duration_minutes,
+                s.energy,
+                s.sleep_quality,
+                (SELECT SUM(duration_min) FROM exercise_cardio e WHERE e.date = s.date) as cardio_min,
+                (SELECT SUM(reps * sets) FROM exercise_resistance r WHERE r.date = s.date AND r.exercise_type = 'pushups') as pushups
+            FROM sleep_logs s
+            WHERE s.date >= date('now', '-30 days')
+            ORDER BY s.date DESC
+        """
+        df = _query_dataframe(query)
+        patterns = []
+        if len(df) > 10 and df['cardio_min'].notna().sum() > 5:
             corr = df['cardio_min'].corr(df['energy'])
             if abs(corr) > 0.3:
                 patterns.append({
@@ -2039,8 +2328,9 @@ def discover_correlations() -> List[Dict]:
                     'correlation_value': corr,
                     'significance': 'moderate' if abs(corr) > 0.5 else 'weak'
                 })
-    
-    return patterns
+        return patterns
+
+    return _cached_read(key, _load)
 
 # =============================================================================
 # ROUTINES OPERATIONS
@@ -2048,32 +2338,48 @@ def discover_correlations() -> List[Dict]:
 
 def get_routine_templates() -> List[Dict]:
     """Get all active routine templates."""
-    conn = get_connection()
-    templates = conn.execute("""
-        SELECT * FROM routine_templates 
-        WHERE active = 1
-        ORDER BY time_available
-    """).fetchall()
-    conn.close()
-    return [dict(row) for row in templates]
+    key = ("get_routine_templates",)
+
+    def _load():
+        conn = get_connection()
+        templates = conn.execute(
+            """
+            SELECT * FROM routine_templates
+            WHERE active = 1
+            ORDER BY time_available
+            """
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in templates]
+
+    return _cached_read(key, _load)
 
 def get_routine_items(template_id: int) -> List[Dict]:
     """Get all items for a routine template."""
-    conn = get_connection()
-    items = conn.execute("""
-        SELECT ri.*
-        FROM routine_items ri
-        LEFT JOIN routine_items parent
-          ON parent.id = ri.parent_item_id
-         AND parent.active = 1
-         AND parent.template_id = ri.template_id
-        WHERE ri.template_id = ?
-          AND ri.active = 1
-          AND (ri.parent_item_id IS NULL OR parent.id IS NOT NULL)
-        ORDER BY order_index
-    """, (template_id,)).fetchall()  # Add the parameter here!
-    conn.close()
-    return [dict(row) for row in items]
+    template_id = int(template_id)
+    key = ("get_routine_items", template_id)
+
+    def _load():
+        conn = get_connection()
+        items = conn.execute(
+            """
+            SELECT ri.*
+            FROM routine_items ri
+            LEFT JOIN routine_items parent
+              ON parent.id = ri.parent_item_id
+             AND parent.active = 1
+             AND parent.template_id = ri.template_id
+            WHERE ri.template_id = ?
+              AND ri.active = 1
+              AND (ri.parent_item_id IS NULL OR parent.id IS NOT NULL)
+            ORDER BY order_index
+            """,
+            (template_id,),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in items]
+
+    return _cached_read(key, _load)
 
 def update_routine_item_progress(date: str, template_id: int, item_id: int, completed: bool):
     """Update progress for a routine item."""
@@ -2092,13 +2398,22 @@ def update_routine_item_progress(date: str, template_id: int, item_id: int, comp
 
 def is_routine_submitted(date: str, template_id: int) -> bool:
     """Check if a routine has been submitted for the day."""
-    conn = get_connection()
-    result = conn.execute("""
-        SELECT id FROM routine_submissions
-        WHERE date = ? AND template_id = ?
-    """, (date, template_id)).fetchone()
-    conn.close()
-    return result is not None
+    template_id = int(template_id)
+    key = ("is_routine_submitted", date, template_id)
+
+    def _load():
+        conn = get_connection()
+        result = conn.execute(
+            """
+            SELECT id FROM routine_submissions
+            WHERE date = ? AND template_id = ?
+            """,
+            (date, template_id),
+        ).fetchone()
+        conn.close()
+        return result is not None
+
+    return _cached_read(key, _load)
 
 def submit_routine(date: str, template_id: int) -> int:
     """Mark routine as submitted (XP awarded at midnight). Returns total XP that will be awarded."""
@@ -2273,16 +2588,23 @@ def update_routine_item(item_id: int, item_text: str, xp_value: int):
 
 def get_today_routine_progress(date: str, template_id: int) -> dict:
     """Get progress for a routine on a specific date. Returns dict of {item_id: completed}."""
-    conn = get_connection()
-    progress = conn.execute("""
-        SELECT item_id, completed 
-        FROM daily_routine_progress 
-        WHERE date = ? AND template_id = ?
-    """, (date, template_id)).fetchall()
-    conn.close()
-    
-    result = {row['item_id']: bool(row['completed']) for row in progress}
-    return result
+    template_id = int(template_id)
+    key = ("get_today_routine_progress", date, template_id)
+
+    def _load():
+        conn = get_connection()
+        progress = conn.execute(
+            """
+            SELECT item_id, completed
+            FROM daily_routine_progress
+            WHERE date = ? AND template_id = ?
+            """,
+            (date, template_id),
+        ).fetchall()
+        conn.close()
+        return {row['item_id']: bool(row['completed']) for row in progress}
+
+    return _cached_read(key, _load)
 
 
 # =============================================================================
