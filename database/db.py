@@ -79,14 +79,16 @@ RENAISSANCE_THRESHOLDS = {
 }
 
 _PG_POOL = None
+_PG_POOL_PID: Optional[int] = None
 _PG_POOL_LOCK = threading.Lock()
 _READ_CACHE_LOCK = threading.Lock()
 _READ_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 _READ_CACHE_VERSION = 0
 _WRITE_BEHIND_QUEUE: "queue.Queue[List[Tuple[str, Any]]]" = queue.Queue()
 _WRITE_BEHIND_THREAD = None
+_WRITE_BEHIND_THREAD_PID: Optional[int] = None
 _WRITE_BEHIND_LOCK = threading.Lock()
-_WRITE_BEHIND_ATEXIT_REGISTERED = False
+_WRITE_BEHIND_ATEXIT_PID: Optional[int] = None
 _LOCAL_CACHE_READY = False
 _LOCAL_CACHE_READY_LOCK = threading.Lock()
 _CACHE_TAGS_BY_PREFIX: Dict[str, Set[str]] = {
@@ -539,13 +541,38 @@ def _is_mutating_sql(query: str) -> bool:
 
 
 def _get_postgres_pool():
-    global _PG_POOL
+    global _PG_POOL, _PG_POOL_PID
     if psycopg2_pool is None:
         raise RuntimeError("DATABASE_URL is set but psycopg2 pool is unavailable")
+    current_pid = os.getpid()
+    if _PG_POOL is not None and _PG_POOL_PID != current_pid:
+        _diag(
+            "pg.pool.pid_mismatch_reset",
+            pool_pid=_PG_POOL_PID,
+            current_pid=current_pid,
+        )
+        try:
+            _PG_POOL.closeall()
+        except Exception:
+            pass
+        _PG_POOL = None
+        _PG_POOL_PID = None
     if _PG_POOL is not None:
         _diag("pg.pool.reuse", verbose=True)
         return _PG_POOL
     with _PG_POOL_LOCK:
+        if _PG_POOL is not None and _PG_POOL_PID != current_pid:
+            _diag(
+                "pg.pool.pid_mismatch_reset_locked",
+                pool_pid=_PG_POOL_PID,
+                current_pid=current_pid,
+            )
+            try:
+                _PG_POOL.closeall()
+            except Exception:
+                pass
+            _PG_POOL = None
+            _PG_POOL_PID = None
         if _PG_POOL is None:
             min_conn = max(1, int(os.getenv("PG_POOL_MIN_CONN", "1")))
             default_max = max(4, int(os.getenv("WEB_CONCURRENCY", "1")) * 4)
@@ -572,6 +599,7 @@ def _get_postgres_pool():
                         connect_timeout=connect_timeout,
                         application_name="renaissance-man",
                     )
+                    _PG_POOL_PID = current_pid
                     _diag("pg.pool.create_success", attempt=attempt)
                     break
                 except Exception as exc:
@@ -909,9 +937,19 @@ def _quote_ident(identifier: str) -> str:
 
 
 def _start_write_behind_worker():
-    global _WRITE_BEHIND_THREAD, _WRITE_BEHIND_ATEXIT_REGISTERED
+    global _WRITE_BEHIND_QUEUE, _WRITE_BEHIND_THREAD, _WRITE_BEHIND_THREAD_PID, _WRITE_BEHIND_ATEXIT_PID
+    current_pid = os.getpid()
     with _WRITE_BEHIND_LOCK:
-        if _WRITE_BEHIND_THREAD and _WRITE_BEHIND_THREAD.is_alive():
+        if _WRITE_BEHIND_THREAD and _WRITE_BEHIND_THREAD_PID != current_pid:
+            _diag(
+                "write_behind.worker_pid_mismatch_reset",
+                worker_pid=_WRITE_BEHIND_THREAD_PID,
+                current_pid=current_pid,
+            )
+            _WRITE_BEHIND_THREAD = None
+            _WRITE_BEHIND_THREAD_PID = None
+            _WRITE_BEHIND_QUEUE = queue.Queue()
+        if _WRITE_BEHIND_THREAD and _WRITE_BEHIND_THREAD.is_alive() and _WRITE_BEHIND_THREAD_PID == current_pid:
             _diag("write_behind.worker_reuse", verbose=True)
             return
         _WRITE_BEHIND_THREAD = threading.Thread(
@@ -920,11 +958,12 @@ def _start_write_behind_worker():
             daemon=True,
         )
         _WRITE_BEHIND_THREAD.start()
+        _WRITE_BEHIND_THREAD_PID = current_pid
         _diag("write_behind.worker_started")
-        if not _WRITE_BEHIND_ATEXIT_REGISTERED:
+        if _WRITE_BEHIND_ATEXIT_PID != current_pid:
             atexit.register(_flush_write_behind_queue)
-            _WRITE_BEHIND_ATEXIT_REGISTERED = True
-            _diag("write_behind.atexit_registered", verbose=True)
+            _WRITE_BEHIND_ATEXIT_PID = current_pid
+            _diag("write_behind.atexit_registered", pid=current_pid, verbose=True)
 
 
 def _enqueue_write_behind(ops: List[Tuple[str, Any]]):
@@ -932,6 +971,7 @@ def _enqueue_write_behind(ops: List[Tuple[str, Any]]):
         return
     if not ops:
         return
+    _start_write_behind_worker()
     queue_before = _WRITE_BEHIND_QUEUE.qsize()
     _WRITE_BEHIND_QUEUE.put(list(ops))
     _diag(
@@ -1196,6 +1236,7 @@ def get_connection():
     """Get database connection."""
     if USE_LOCAL_CACHE_PRIMARY:
         _ensure_local_cache_ready()
+        _start_write_behind_worker()
         _diag(
             "db.connection_mode",
             mode="sqlite_write_behind",
