@@ -841,16 +841,37 @@ def _copy_postgres_to_local_cache(local_conn, pg_conn):
         placeholders = ", ".join("?" for _ in cols)
 
         try:
-            rows = pg_conn.execute(
-                f"SELECT {quoted_cols} FROM {quoted_table}"
+            pg_cols_rows = pg_conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = ?
+                """,
+                (table,),
             ).fetchall()
-        except Exception:
-            # Table might not exist in Postgres if it's local-only; keep local empty.
-            rows = []
+            pg_cols = {str(row["column_name"]) for row in pg_cols_rows}
+            common_cols = [col for col in cols if col in pg_cols]
+            if not common_cols:
+                print(f"[cache-hydrate] skipping '{table}': no shared columns found in Postgres")
+                continue
+
+            quoted_common_cols = ", ".join(_quote_ident(c) for c in common_cols)
+            rows = pg_conn.execute(
+                f"SELECT {quoted_common_cols} FROM {quoted_table}"
+            ).fetchall()
+        except Exception as exc:
+            # Table might not exist in Postgres or may have incompatible structure.
+            print(f"[cache-hydrate] failed for '{table}': {exc}")
+            continue
 
         local_conn.execute(f"DELETE FROM {quoted_table}")
+        common_set = set(common_cols)
         for row in rows:
-            values = tuple(_to_sqlite_value(row.get(col)) for col in cols)
+            values = tuple(
+                _to_sqlite_value(row.get(col)) if col in common_set else None
+                for col in cols
+            )
             local_conn.execute(
                 f"INSERT INTO {quoted_table} ({quoted_cols}) VALUES ({placeholders})",
                 values,
