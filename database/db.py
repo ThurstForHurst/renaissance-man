@@ -764,11 +764,14 @@ def _write_behind_worker_loop():
 
 
 def _flush_write_behind_queue(timeout_seconds: float = 8.0):
-    deadline = time_module.time() + max(0.0, float(timeout_seconds))
-    while time_module.time() < deadline:
+    # Use a local import to avoid any global name shadowing edge cases.
+    import time as _time
+
+    deadline = _time.time() + max(0.0, float(timeout_seconds))
+    while _time.time() < deadline:
         if _WRITE_BEHIND_QUEUE.empty():
             return
-        time_module.sleep(0.05)
+        _time.sleep(0.05)
 
 
 def _prepare_local_cache_schema(local_conn):
