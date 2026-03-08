@@ -469,13 +469,32 @@ def _get_postgres_pool():
             min_conn = max(1, int(os.getenv("PG_POOL_MIN_CONN", "1")))
             default_max = max(4, int(os.getenv("WEB_CONCURRENCY", "1")) * 4)
             max_conn = max(min_conn, int(os.getenv("PG_POOL_MAX_CONN", str(default_max))))
-            _PG_POOL = psycopg2_pool.ThreadedConnectionPool(
-                min_conn,
-                max_conn,
-                DATABASE_URL,
-                connect_timeout=int(os.getenv("PG_CONNECT_TIMEOUT", "10")),
-                application_name="renaissance-man",
-            )
+            connect_timeout = int(os.getenv("PG_CONNECT_TIMEOUT", "10"))
+            connect_retries = max(1, int(os.getenv("PG_CONNECT_RETRIES", "6")))
+            retry_delay = max(1, int(os.getenv("PG_CONNECT_RETRY_DELAY", "5")))
+            last_exc = None
+            for attempt in range(1, connect_retries + 1):
+                try:
+                    _PG_POOL = psycopg2_pool.ThreadedConnectionPool(
+                        min_conn,
+                        max_conn,
+                        DATABASE_URL,
+                        connect_timeout=connect_timeout,
+                        application_name="renaissance-man",
+                    )
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt >= connect_retries:
+                        raise
+                    wait_seconds = retry_delay * attempt
+                    print(
+                        f"Postgres connection attempt {attempt}/{connect_retries} failed: {exc}. "
+                        f"Retrying in {wait_seconds}s..."
+                    )
+                    time.sleep(wait_seconds)
+            if _PG_POOL is None and last_exc is not None:
+                raise last_exc
     return _PG_POOL
 
 
