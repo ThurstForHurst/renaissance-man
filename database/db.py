@@ -1490,6 +1490,19 @@ def _install_postgres_compat_functions(conn):
 
 def init_db():
     """Initialize database with schema."""
+    print(
+        (
+            "[diag-bootstrap] "
+            f"app_diagnostics={_APP_DIAGNOSTICS} "
+            f"app_diagnostics_verbose={_APP_DIAGNOSTICS_VERBOSE} "
+            f"app_diagnostics_sql={_APP_DIAGNOSTICS_SQL} "
+            f"use_postgres={USE_POSTGRES} "
+            f"use_local_cache_primary={USE_LOCAL_CACHE_PRIMARY} "
+            f"render_service={os.getenv('RENDER_SERVICE_NAME', 'n/a')} "
+            f"render_commit={os.getenv('RENDER_GIT_COMMIT', 'n/a')}"
+        ),
+        flush=True,
+    )
     _diag(
         "init_db.start",
         use_postgres=USE_POSTGRES,
