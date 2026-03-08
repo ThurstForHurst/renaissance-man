@@ -8,7 +8,7 @@ import copy
 import sqlite3
 import threading
 import queue
-import time
+import time as time_module
 import atexit
 import tempfile
 from decimal import Decimal
@@ -492,7 +492,7 @@ def _get_postgres_pool():
                         f"Postgres connection attempt {attempt}/{connect_retries} failed: {exc}. "
                         f"Retrying in {wait_seconds}s..."
                     )
-                    time.sleep(wait_seconds)
+                    time_module.sleep(wait_seconds)
             if _PG_POOL is None and last_exc is not None:
                 raise last_exc
     return _PG_POOL
@@ -751,7 +751,7 @@ def _write_behind_worker_loop():
                     except Exception:
                         pass
                 print(f"[write-behind] Postgres sync failed, retrying in {delay_seconds:.2f}s: {exc}")
-                time.sleep(delay_seconds)
+                time_module.sleep(delay_seconds)
                 delay_seconds = min(delay_seconds * 2, 10.0)
             finally:
                 if conn is not None:
@@ -764,11 +764,11 @@ def _write_behind_worker_loop():
 
 
 def _flush_write_behind_queue(timeout_seconds: float = 8.0):
-    deadline = time.time() + max(0.0, float(timeout_seconds))
-    while time.time() < deadline:
+    deadline = time_module.time() + max(0.0, float(timeout_seconds))
+    while time_module.time() < deadline:
         if _WRITE_BEHIND_QUEUE.empty():
             return
-        time.sleep(0.05)
+        time_module.sleep(0.05)
 
 
 def _prepare_local_cache_schema(local_conn):
@@ -4995,7 +4995,7 @@ def dag_unlock_node(user_id: str, node_id: str, graph_id: str = DEFAULT_DAG_GRAP
     if random.random() < effective_prob:
         bonus_triggered = True
         bonus_xp = BONUS_XP_REWARD
-        award_xp(get_brisbane_date(), domain, f"dag_bonus_{node_id}_{int(time.time())}", bonus_xp, notes=f"DAG bonus: {node.get('name')}")
+        award_xp(get_brisbane_date(), domain, f"dag_bonus_{node_id}_{int(time_module.time())}", bonus_xp, notes=f"DAG bonus: {node.get('name')}")
         log_dag_event("bonus_drop", node_id, {"bonus_xp": bonus_xp, "effective_prob": effective_prob}, user_id=user_id)
 
     log_dag_event("node_unlocked", node_id, {"xp_reward": xp_reward, "bonus_triggered": bonus_triggered, "bonus_xp": bonus_xp}, user_id=user_id)
