@@ -120,6 +120,71 @@ _CACHE_TAGS_BY_PREFIX: Dict[str, Set[str]] = {
 }
 
 
+_APP_DIAGNOSTICS = os.getenv("APP_DIAGNOSTICS", "0").strip().lower() in {"1", "true", "yes", "on"}
+_APP_DIAGNOSTICS_VERBOSE = os.getenv("APP_DIAGNOSTICS_VERBOSE", "0").strip().lower() in {"1", "true", "yes", "on"}
+_APP_DIAGNOSTICS_SQL = os.getenv("APP_DIAGNOSTICS_SQL", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _diag_enabled(verbose: bool = False) -> bool:
+    if not _APP_DIAGNOSTICS:
+        return False
+    if verbose and not _APP_DIAGNOSTICS_VERBOSE:
+        return False
+    return True
+
+
+def _diag_value(value: Any) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).replace("\n", "\\n")
+    if len(text) > 240:
+        text = text[:240] + "...<truncated>"
+    return text
+
+
+def _diag_query_head(query: str) -> str:
+    q = " ".join((query or "").split())
+    if len(q) > 180:
+        q = q[:180] + "...<truncated>"
+    return q
+
+
+def _diag_params_preview(params: Any) -> str:
+    if params is None:
+        return "None"
+    if isinstance(params, dict):
+        items = list(params.items())
+        preview = ", ".join(
+            f"{_diag_value(k)}={_diag_value(v)}"
+            for k, v in items[:8]
+        )
+        if len(items) > 8:
+            preview += f", ...(+{len(items) - 8} more)"
+        return "{" + preview + "}"
+    if isinstance(params, (tuple, list)):
+        values = list(params)
+        preview = ", ".join(_diag_value(v) for v in values[:8])
+        if len(values) > 8:
+            preview += f", ...(+{len(values) - 8} more)"
+        return "[" + preview + "]"
+    return _diag_value(params)
+
+
+def _diag(event: str, *, verbose: bool = False, **fields: Any):
+    if not _diag_enabled(verbose=verbose):
+        return
+    ts = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    thread_name = threading.current_thread().name
+    parts = [f"ts={ts}", f"pid={os.getpid()}", f"thr={thread_name}", f"event={event}"]
+    for key, value in fields.items():
+        parts.append(f"{key}={_diag_value(value)}")
+    print("[diag] " + " ".join(parts), flush=True)
+
+
 def _cache_tags_for_key(key: Tuple[Any, ...]) -> Set[str]:
     if not key:
         return set()
@@ -184,37 +249,44 @@ def _clone_cached_value(value: Any) -> Any:
 
 def _invalidate_cached_reads(tables: Optional[Set[str]] = None):
     global _READ_CACHE_VERSION
-    keys_to_refresh: List[Tuple[Any, ...]] = []
     with _READ_CACHE_LOCK:
         if not tables or "*" in tables:
+            before = len(_READ_CACHE)
             _READ_CACHE_VERSION += 1
             _READ_CACHE.clear()
+            _diag(
+                "cache.invalidate_all",
+                cache_version=_READ_CACHE_VERSION,
+                dropped_keys=before,
+            )
             return
 
         normalized = {_normalize_table_name(t) for t in tables if t}
         if not normalized:
+            _diag("cache.invalidate_skip", reason="no_normalized_tables", verbose=True)
             return
 
+        keys_to_drop: List[Tuple[Any, ...]] = []
         for key, entry in _READ_CACHE.items():
             tags = set(entry.get("tags", set()))
             if not tags or (tags & normalized):
-                entry["stale"] = True
-                if not entry.get("refreshing"):
-                    entry["refreshing"] = True
-                    keys_to_refresh.append(key)
+                keys_to_drop.append(key)
 
-    for key in keys_to_refresh:
-        threading.Thread(
-            target=_refresh_cached_key,
-            args=(key,),
-            daemon=True,
-        ).start()
+        for key in keys_to_drop:
+            _READ_CACHE.pop(key, None)
+        _diag(
+            "cache.invalidate_tables",
+            tables=",".join(sorted(normalized)),
+            dropped_keys=len(keys_to_drop),
+            cache_size=len(_READ_CACHE),
+        )
 
 
 def _refresh_cached_key(key: Tuple[Any, ...]):
     with _READ_CACHE_LOCK:
         entry = _READ_CACHE.get(key)
         if not entry:
+            _diag("cache.refresh.skip", key=key, reason="missing_entry", verbose=True)
             return
         loader = entry.get("loader")
         version = entry.get("version")
@@ -225,11 +297,14 @@ def _refresh_cached_key(key: Tuple[Any, ...]):
             if current and current.get("version") == version:
                 current["refreshing"] = False
                 current["stale"] = False
+        _diag("cache.refresh.skip", key=key, reason="missing_loader", verbose=True)
         return
 
+    _diag("cache.refresh.start", key=key, version=version, verbose=True)
     try:
         value = loader()
-    except Exception:
+    except Exception as exc:
+        _diag("cache.refresh.error", key=key, version=version, error=exc)
         with _READ_CACHE_LOCK:
             current = _READ_CACHE.get(key)
             if current and current.get("version") == version:
@@ -242,15 +317,18 @@ def _refresh_cached_key(key: Tuple[Any, ...]):
             current["value"] = _clone_cached_value(value)
             current["stale"] = False
             current["refreshing"] = False
+    _diag("cache.refresh.complete", key=key, version=version, verbose=True)
 
 
 def _cached_read(key: Tuple[Any, ...], loader: Callable[[], Any]) -> Any:
     with _READ_CACHE_LOCK:
         entry = _READ_CACHE.get(key)
         if entry and entry.get("version") == _READ_CACHE_VERSION:
+            _diag("cache.hit", key=key, cache_version=_READ_CACHE_VERSION, verbose=True)
             if entry.get("stale"):
                 if not entry.get("refreshing"):
                     entry["refreshing"] = True
+                    _diag("cache.refresh.dispatch", key=key, cache_version=_READ_CACHE_VERSION, verbose=True)
                     threading.Thread(
                         target=_refresh_cached_key,
                         args=(key,),
@@ -258,6 +336,7 @@ def _cached_read(key: Tuple[Any, ...], loader: Callable[[], Any]) -> Any:
                     ).start()
             return _clone_cached_value(entry.get("value"))
 
+    _diag("cache.miss", key=key, cache_version=_READ_CACHE_VERSION)
     value = loader()
     with _READ_CACHE_LOCK:
         _READ_CACHE[key] = {
@@ -268,6 +347,7 @@ def _cached_read(key: Tuple[Any, ...], loader: Callable[[], Any]) -> Any:
             "stale": False,
             "refreshing": False,
         }
+    _diag("cache.store", key=key, cache_version=_READ_CACHE_VERSION, verbose=True)
     return _clone_cached_value(value)
 
 
@@ -463,6 +543,7 @@ def _get_postgres_pool():
     if psycopg2_pool is None:
         raise RuntimeError("DATABASE_URL is set but psycopg2 pool is unavailable")
     if _PG_POOL is not None:
+        _diag("pg.pool.reuse", verbose=True)
         return _PG_POOL
     with _PG_POOL_LOCK:
         if _PG_POOL is None:
@@ -473,8 +554,17 @@ def _get_postgres_pool():
             connect_retries = max(1, int(os.getenv("PG_CONNECT_RETRIES", "6")))
             retry_delay = max(1, int(os.getenv("PG_CONNECT_RETRY_DELAY", "5")))
             last_exc = None
+            _diag(
+                "pg.pool.create_start",
+                min_conn=min_conn,
+                max_conn=max_conn,
+                connect_timeout=connect_timeout,
+                connect_retries=connect_retries,
+                retry_delay=retry_delay,
+            )
             for attempt in range(1, connect_retries + 1):
                 try:
+                    _diag("pg.pool.create_attempt", attempt=attempt, verbose=True)
                     _PG_POOL = psycopg2_pool.ThreadedConnectionPool(
                         min_conn,
                         max_conn,
@@ -482,9 +572,11 @@ def _get_postgres_pool():
                         connect_timeout=connect_timeout,
                         application_name="renaissance-man",
                     )
+                    _diag("pg.pool.create_success", attempt=attempt)
                     break
                 except Exception as exc:
                     last_exc = exc
+                    _diag("pg.pool.create_error", attempt=attempt, error=exc)
                     if attempt >= connect_retries:
                         raise
                     wait_seconds = retry_delay * attempt
@@ -553,18 +645,50 @@ class _PostgresConnection:
         self._closed = False
         self._has_pending_write = False
         self._mutated_tables: Set[str] = set()
+        _diag("pg.conn.open", conn_id=id(self._conn), verbose=True)
 
     def cursor(self, *args, **kwargs):
         return self._conn.cursor(*args, **kwargs)
 
     def execute(self, query: str, params=None):
         cur = self._conn.cursor(cursor_factory=RealDictCursor)
-        if params is None:
-            # Keep raw SQL intact (e.g., PL/pgSQL bodies that use '%' in RAISE format strings).
-            cur.execute(query)
-        else:
-            pg_query = _adapt_query_for_postgres(query)
-            cur.execute(pg_query, params)
+        started = time_module.perf_counter()
+        is_mutating = _is_mutating_sql(query)
+        params_count = (
+            len(params) if isinstance(params, (tuple, list, dict)) else (1 if params is not None else 0)
+        )
+        try:
+            if params is None:
+                # Keep raw SQL intact (e.g., PL/pgSQL bodies that use '%' in RAISE format strings).
+                cur.execute(query)
+            else:
+                pg_query = _adapt_query_for_postgres(query)
+                cur.execute(pg_query, params)
+        except Exception as exc:
+            _diag(
+                "sql.exec.pg.error",
+                query=_diag_query_head(query),
+                params_count=params_count,
+                params_preview=_diag_params_preview(params),
+                mutating=is_mutating,
+                error=exc,
+            )
+            try:
+                cur.close()
+            except Exception:
+                pass
+            raise
+        if _APP_DIAGNOSTICS_SQL:
+            _diag(
+                "sql.exec.pg",
+                query=_diag_query_head(query),
+                params_count=params_count,
+                params_preview=_diag_params_preview(params),
+                mutating=is_mutating,
+                rowcount=getattr(cur, "rowcount", None),
+                elapsed_ms=int((time_module.perf_counter() - started) * 1000),
+                verbose=True,
+            )
         first = (query or "").lstrip().split(None, 1)
         command = first[0].upper() if first else ""
         if command == "COMMIT":
@@ -592,6 +716,13 @@ class _PostgresConnection:
                 self.execute(stmt)
 
     def commit(self):
+        _diag(
+            "pg.conn.commit",
+            conn_id=id(self._conn),
+            pending_write=self._has_pending_write,
+            mutated_tables=",".join(sorted(self._mutated_tables)) if self._mutated_tables else "none",
+            verbose=True,
+        )
         self._conn.commit()
         if self._has_pending_write:
             _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
@@ -599,6 +730,13 @@ class _PostgresConnection:
         self._mutated_tables.clear()
 
     def rollback(self):
+        _diag(
+            "pg.conn.rollback",
+            conn_id=id(self._conn),
+            pending_write=self._has_pending_write,
+            mutated_tables=",".join(sorted(self._mutated_tables)) if self._mutated_tables else "none",
+            verbose=True,
+        )
         self._conn.rollback()
         self._has_pending_write = False
         self._mutated_tables.clear()
@@ -606,6 +744,7 @@ class _PostgresConnection:
     def close(self):
         if self._closed:
             return
+        _diag("pg.conn.close", conn_id=id(self._conn), verbose=True)
         try:
             # Avoid returning connections with open transactions to the pool.
             self._conn.rollback()
@@ -631,12 +770,43 @@ class _SQLiteConnection:
         self._conn.row_factory = sqlite3.Row
         self._has_pending_write = False
         self._mutated_tables: Set[str] = set()
+        self._db_path = str(db_path)
+        _diag("sqlite.conn.open", db_path=self._db_path, conn_id=id(self._conn), verbose=True)
 
     def execute(self, query: str, params=None):
-        if params is None:
-            cur = self._conn.execute(query)
-        else:
-            cur = self._conn.execute(query, params)
+        started = time_module.perf_counter()
+        is_mutating = _is_mutating_sql(query)
+        params_count = (
+            len(params) if isinstance(params, (tuple, list, dict)) else (1 if params is not None else 0)
+        )
+        try:
+            if params is None:
+                cur = self._conn.execute(query)
+            else:
+                cur = self._conn.execute(query, params)
+        except Exception as exc:
+            _diag(
+                "sql.exec.sqlite.error",
+                query=_diag_query_head(query),
+                params_count=params_count,
+                params_preview=_diag_params_preview(params),
+                mutating=is_mutating,
+                db_path=self._db_path,
+                error=exc,
+            )
+            raise
+        if _APP_DIAGNOSTICS_SQL:
+            _diag(
+                "sql.exec.sqlite",
+                query=_diag_query_head(query),
+                params_count=params_count,
+                params_preview=_diag_params_preview(params),
+                mutating=is_mutating,
+                rowcount=getattr(cur, "rowcount", None),
+                db_path=self._db_path,
+                elapsed_ms=int((time_module.perf_counter() - started) * 1000),
+                verbose=True,
+            )
         first = (query or "").lstrip().split(None, 1)
         command = first[0].upper() if first else ""
         if command == "COMMIT":
@@ -657,6 +827,14 @@ class _SQLiteConnection:
         return cur
 
     def commit(self):
+        _diag(
+            "sqlite.conn.commit",
+            db_path=self._db_path,
+            conn_id=id(self._conn),
+            pending_write=self._has_pending_write,
+            mutated_tables=",".join(sorted(self._mutated_tables)) if self._mutated_tables else "none",
+            verbose=True,
+        )
         self._conn.commit()
         if self._has_pending_write:
             _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
@@ -664,11 +842,20 @@ class _SQLiteConnection:
         self._mutated_tables.clear()
 
     def rollback(self):
+        _diag(
+            "sqlite.conn.rollback",
+            db_path=self._db_path,
+            conn_id=id(self._conn),
+            pending_write=self._has_pending_write,
+            mutated_tables=",".join(sorted(self._mutated_tables)) if self._mutated_tables else "none",
+            verbose=True,
+        )
         self._conn.rollback()
         self._has_pending_write = False
         self._mutated_tables.clear()
 
     def close(self):
+        _diag("sqlite.conn.close", db_path=self._db_path, conn_id=id(self._conn), verbose=True)
         self._conn.close()
 
     def __getattr__(self, name):
@@ -687,16 +874,33 @@ class _SQLiteWriteBehindConnection(_SQLiteConnection):
         if _is_mutating_sql(query) and command not in {"COMMIT", "ROLLBACK"}:
             safe_params = tuple(params) if isinstance(params, list) else params
             self._mirror_ops.append((query, safe_params))
+            _diag(
+                "write_behind.recorded_op",
+                command=command,
+                ops_buffer=len(self._mirror_ops),
+                query=_diag_query_head(query),
+                params_preview=_diag_params_preview(safe_params),
+                verbose=True,
+            )
         return cur
 
     def commit(self):
         super().commit()
         if self._mirror_ops:
+            _diag(
+                "write_behind.commit_enqueue",
+                ops_count=len(self._mirror_ops),
+                first_query=_diag_query_head(self._mirror_ops[0][0]),
+                last_query=_diag_query_head(self._mirror_ops[-1][0]),
+                queue_before=_WRITE_BEHIND_QUEUE.qsize(),
+            )
             _enqueue_write_behind(self._mirror_ops)
             self._mirror_ops = []
 
     def rollback(self):
         super().rollback()
+        if self._mirror_ops:
+            _diag("write_behind.rollback_drop_ops", ops_count=len(self._mirror_ops))
         self._mirror_ops = []
 
 
@@ -708,6 +912,7 @@ def _start_write_behind_worker():
     global _WRITE_BEHIND_THREAD, _WRITE_BEHIND_ATEXIT_REGISTERED
     with _WRITE_BEHIND_LOCK:
         if _WRITE_BEHIND_THREAD and _WRITE_BEHIND_THREAD.is_alive():
+            _diag("write_behind.worker_reuse", verbose=True)
             return
         _WRITE_BEHIND_THREAD = threading.Thread(
             target=_write_behind_worker_loop,
@@ -715,9 +920,11 @@ def _start_write_behind_worker():
             daemon=True,
         )
         _WRITE_BEHIND_THREAD.start()
+        _diag("write_behind.worker_started")
         if not _WRITE_BEHIND_ATEXIT_REGISTERED:
             atexit.register(_flush_write_behind_queue)
             _WRITE_BEHIND_ATEXIT_REGISTERED = True
+            _diag("write_behind.atexit_registered", verbose=True)
 
 
 def _enqueue_write_behind(ops: List[Tuple[str, Any]]):
@@ -725,7 +932,14 @@ def _enqueue_write_behind(ops: List[Tuple[str, Any]]):
         return
     if not ops:
         return
+    queue_before = _WRITE_BEHIND_QUEUE.qsize()
     _WRITE_BEHIND_QUEUE.put(list(ops))
+    _diag(
+        "write_behind.enqueued",
+        ops_count=len(ops),
+        queue_before=queue_before,
+        queue_after=_WRITE_BEHIND_QUEUE.qsize(),
+    )
 
 
 def _write_behind_worker_loop():
@@ -733,16 +947,27 @@ def _write_behind_worker_loop():
         ops = _WRITE_BEHIND_QUEUE.get()
         if ops is None:
             _WRITE_BEHIND_QUEUE.task_done()
+            _diag("write_behind.worker_stop_signal")
             return
 
+        batch_started = time_module.time()
+        _diag("write_behind.batch_start", ops_count=len(ops), queue_size=_WRITE_BEHIND_QUEUE.qsize())
         delay_seconds = 0.25
+        attempts = 0
         while True:
             conn = None
+            attempts += 1
             try:
                 conn = _PostgresConnection()
                 for query, params in ops:
                     conn.execute(query, params)
                 conn.commit()
+                _diag(
+                    "write_behind.batch_success",
+                    ops_count=len(ops),
+                    attempts=attempts,
+                    elapsed_ms=int((time_module.time() - batch_started) * 1000),
+                )
                 break
             except Exception as exc:
                 if conn is not None:
@@ -751,6 +976,13 @@ def _write_behind_worker_loop():
                     except Exception:
                         pass
                 print(f"[write-behind] Postgres sync failed, retrying in {delay_seconds:.2f}s: {exc}")
+                _diag(
+                    "write_behind.batch_retry",
+                    ops_count=len(ops),
+                    attempts=attempts,
+                    delay_seconds=round(delay_seconds, 2),
+                    error=exc,
+                )
                 time_module.sleep(delay_seconds)
                 delay_seconds = min(delay_seconds * 2, 10.0)
             finally:
@@ -767,11 +999,14 @@ def _flush_write_behind_queue(timeout_seconds: float = 8.0):
     # Use a local import to avoid any global name shadowing edge cases.
     import time as _time
 
+    _diag("write_behind.flush_start", timeout_seconds=timeout_seconds, queue_size=_WRITE_BEHIND_QUEUE.qsize())
     deadline = _time.time() + max(0.0, float(timeout_seconds))
     while _time.time() < deadline:
         if _WRITE_BEHIND_QUEUE.empty():
+            _diag("write_behind.flush_complete", queue_size=0)
             return
         _time.sleep(0.05)
+    _diag("write_behind.flush_timeout", queue_size=_WRITE_BEHIND_QUEUE.qsize())
 
 
 def _prepare_local_cache_schema(local_conn):
@@ -826,14 +1061,21 @@ def _copy_postgres_to_local_cache(local_conn, pg_conn):
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     ]
+    _diag("cache_hydrate.start", tables=len(tables), verbose=True)
 
     local_conn.execute("PRAGMA foreign_keys = OFF")
+    total_rows_copied = 0
+    copied_tables = 0
+    skipped_tables = 0
+    failed_tables = 0
     for table in tables:
         cols = [
             row["name"]
             for row in local_conn.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall()
         ]
         if not cols:
+            skipped_tables += 1
+            _diag("cache_hydrate.skip", table=table, reason="no_local_columns", verbose=True)
             continue
 
         quoted_table = _quote_ident(table)
@@ -854,6 +1096,8 @@ def _copy_postgres_to_local_cache(local_conn, pg_conn):
             common_cols = [col for col in cols if col in pg_cols]
             if not common_cols:
                 print(f"[cache-hydrate] skipping '{table}': no shared columns found in Postgres")
+                skipped_tables += 1
+                _diag("cache_hydrate.skip", table=table, reason="no_shared_columns", verbose=True)
                 continue
 
             quoted_common_cols = ", ".join(_quote_ident(c) for c in common_cols)
@@ -863,6 +1107,8 @@ def _copy_postgres_to_local_cache(local_conn, pg_conn):
         except Exception as exc:
             # Table might not exist in Postgres or may have incompatible structure.
             print(f"[cache-hydrate] failed for '{table}': {exc}")
+            failed_tables += 1
+            _diag("cache_hydrate.failed", table=table, error=exc)
             continue
 
         local_conn.execute(f"DELETE FROM {quoted_table}")
@@ -876,6 +1122,17 @@ def _copy_postgres_to_local_cache(local_conn, pg_conn):
                 f"INSERT INTO {quoted_table} ({quoted_cols}) VALUES ({placeholders})",
                 values,
             )
+        copied_tables += 1
+        row_count = len(rows)
+        total_rows_copied += row_count
+        _diag(
+            "cache_hydrate.table_copied",
+            table=table,
+            rows=row_count,
+            local_columns=len(cols),
+            shared_columns=len(common_cols),
+            verbose=True,
+        )
 
         if "id" in cols:
             try:
@@ -891,6 +1148,13 @@ def _copy_postgres_to_local_cache(local_conn, pg_conn):
 
     local_conn.execute("PRAGMA foreign_keys = ON")
     local_conn.commit()
+    _diag(
+        "cache_hydrate.complete",
+        copied_tables=copied_tables,
+        skipped_tables=skipped_tables,
+        failed_tables=failed_tables,
+        total_rows=total_rows_copied,
+    )
 
 
 def _ensure_local_cache_ready(force_refresh: bool = False):
@@ -898,16 +1162,20 @@ def _ensure_local_cache_ready(force_refresh: bool = False):
     if not USE_LOCAL_CACHE_PRIMARY:
         return
     if _LOCAL_CACHE_READY and not force_refresh:
+        _diag("cache_ready.skip", reason="already_ready", verbose=True)
         return
 
     with _LOCAL_CACHE_READY_LOCK:
         if _LOCAL_CACHE_READY and not force_refresh:
+            _diag("cache_ready.skip_locked", reason="already_ready", verbose=True)
             return
 
         cache_path = Path(LOCAL_CACHE_DB_PATH)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _diag("cache_ready.begin", force_refresh=force_refresh, cache_path=cache_path)
         if cache_path.exists():
             cache_path.unlink()
+            _diag("cache_ready.deleted_existing_file", cache_path=cache_path, verbose=True)
 
         local_conn = _SQLiteConnection(cache_path)
         pg_conn = _PostgresConnection()
@@ -921,19 +1189,28 @@ def _ensure_local_cache_ready(force_refresh: bool = False):
         _start_write_behind_worker()
         _invalidate_cached_reads({"*"})
         _LOCAL_CACHE_READY = True
+        _diag("cache_ready.complete", cache_path=cache_path)
 
 
 def get_connection():
     """Get database connection."""
     if USE_LOCAL_CACHE_PRIMARY:
         _ensure_local_cache_ready()
+        _diag(
+            "db.connection_mode",
+            mode="sqlite_write_behind",
+            cache_path=LOCAL_CACHE_DB_PATH,
+            queue_depth=_WRITE_BEHIND_QUEUE.qsize(),
+        )
         return _SQLiteWriteBehindConnection(Path(LOCAL_CACHE_DB_PATH))
 
     if USE_POSTGRES:
         if psycopg2 is None:
             raise RuntimeError("DATABASE_URL is set but psycopg2 is not installed")
+        _diag("db.connection_mode", mode="postgres")
         return _PostgresConnection()
 
+    _diag("db.connection_mode", mode="sqlite_local_file", db_path=DB_PATH)
     return _SQLiteConnection(Path(DB_PATH))
 
 
@@ -958,12 +1235,31 @@ def _dag_tables_available() -> bool:
 
 
 def _query_dataframe(query: str, params: Optional[tuple] = None) -> pd.DataFrame:
+    started = time_module.perf_counter()
+    _diag(
+        "dataframe.query.start",
+        query=_diag_query_head(query),
+        params_preview=_diag_params_preview(params),
+        verbose=True,
+    )
     conn = get_connection()
-    rows = conn.execute(query, params or ()).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(query, params or ()).fetchall()
+    finally:
+        conn.close()
+    elapsed_ms = int((time_module.perf_counter() - started) * 1000)
     if not rows:
+        _diag("dataframe.query.complete", rows=0, elapsed_ms=elapsed_ms, verbose=True)
         return pd.DataFrame()
-    return pd.DataFrame([dict(row) for row in rows])
+    frame = pd.DataFrame([dict(row) for row in rows])
+    _diag(
+        "dataframe.query.complete",
+        rows=len(rows),
+        columns=",".join(frame.columns.astype(str).tolist()),
+        elapsed_ms=elapsed_ms,
+        verbose=True,
+    )
+    return frame
 
 
 def _ensure_postgres_performance_indexes(conn):
@@ -1194,6 +1490,13 @@ def _install_postgres_compat_functions(conn):
 
 def init_db():
     """Initialize database with schema."""
+    _diag(
+        "init_db.start",
+        use_postgres=USE_POSTGRES,
+        use_local_cache_primary=USE_LOCAL_CACHE_PRIMARY,
+        db_path=DB_PATH,
+        cache_path=LOCAL_CACHE_DB_PATH,
+    )
     if USE_POSTGRES:
         conn = _PostgresConnection()
         bootstrap_updated = _bootstrap_postgres_if_needed(conn)
@@ -1213,6 +1516,11 @@ def init_db():
             _ensure_local_cache_ready(force_refresh=True)
         if bootstrap_updated and os.getenv("RECALCULATE_IDENTITY_ON_BOOT", "0") == "1":
             recalculate_identity_levels_from_logs()
+        _diag(
+            "init_db.postgres_complete",
+            bootstrap_updated=bootstrap_updated,
+            local_cache_ready=USE_LOCAL_CACHE_PRIMARY,
+        )
         if USE_LOCAL_CACHE_PRIMARY:
             print(f"Postgres initialized and local cache hydrated at {LOCAL_CACHE_DB_PATH}")
         else:
@@ -1239,6 +1547,7 @@ def init_db():
     conn.commit()
     conn.close()
     recalculate_identity_levels_from_logs()
+    _diag("init_db.sqlite_complete", db_path=DB_PATH)
     print(f"Database initialized at {DB_PATH}")
 
 
@@ -2723,52 +3032,122 @@ def get_net_worth() -> Dict[str, float]:
 def log_xp(date: str, domain: str, activity: str, xp_gained: int, 
            multiplier: float = 1.0, notes: str = ""):
     """Log XP gain."""
+    _diag(
+        "xp.log.start",
+        date=date,
+        domain=domain,
+        activity=activity,
+        xp_gained=xp_gained,
+        multiplier=multiplier,
+    )
     conn = get_connection()
     final_xp = int(xp_gained * multiplier)
-    
-    conn.execute("""
-        INSERT INTO xp_logs (date, domain, activity, xp_gained, multiplier, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (date, domain, activity, final_xp, multiplier, notes))
-    
-    # Update identity level XP
-    conn.execute("""
-        UPDATE identity_levels 
-        SET xp = xp + ?, updated_at = datetime('now')
-        WHERE domain = ?
-    """, (final_xp, domain))
-    
-    conn.commit()
-    conn.close()
-    return final_xp
+    update_count = None
+    try:
+        conn.execute("""
+            INSERT INTO xp_logs (date, domain, activity, xp_gained, multiplier, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (date, domain, activity, final_xp, multiplier, notes))
+
+        # Update identity level XP
+        update_cur = conn.execute("""
+            UPDATE identity_levels 
+            SET xp = xp + ?, updated_at = datetime('now')
+            WHERE domain = ?
+        """, (final_xp, domain))
+        update_count = getattr(update_cur, "rowcount", None)
+        conn.commit()
+        _diag(
+            "xp.log.success",
+            date=date,
+            domain=domain,
+            activity=activity,
+            final_xp=final_xp,
+            identity_rows_updated=update_count,
+        )
+        return final_xp
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _diag(
+            "xp.log.error",
+            date=date,
+            domain=domain,
+            activity=activity,
+            final_xp=final_xp,
+            identity_rows_updated=update_count,
+            error=exc,
+        )
+        raise
+    finally:
+        conn.close()
 
 def get_identity_levels() -> List[Dict]:
     """Get current identity levels for all domains."""
     key = ("get_identity_levels",)
     def _load():
+        _diag("xp.identity_levels.load_start")
         conn = get_connection()
         levels = conn.execute("SELECT * FROM identity_levels ORDER BY domain").fetchall()
         conn.close()
-        return [dict(row) for row in levels]
+        normalized = [dict(row) for row in levels]
+        _diag(
+            "xp.identity_levels.load_complete",
+            rows=len(normalized),
+            domains=",".join(sorted(str(row.get("domain")) for row in normalized if row.get("domain"))),
+        )
+        return normalized
 
     return _cached_read(key, _load)
 
 def update_identity_level(domain: str, new_level: int, new_name: str):
     """Update identity level when threshold is reached."""
+    _diag("xp.identity.update_start", domain=domain, new_level=new_level, new_name=new_name)
     conn = get_connection()
-    conn.execute("""
-        UPDATE identity_levels 
-        SET level = ?, level_name = ?, updated_at = datetime('now')
-        WHERE domain = ?
-    """, (new_level, new_name, domain))
-    conn.commit()
-    conn.close()
+    try:
+        before = conn.execute(
+            "SELECT level, level_name, xp FROM identity_levels WHERE domain = ?",
+            (domain,),
+        ).fetchone()
+        update_cur = conn.execute("""
+            UPDATE identity_levels 
+            SET level = ?, level_name = ?, updated_at = datetime('now')
+            WHERE domain = ?
+        """, (new_level, new_name, domain))
+        conn.commit()
+        after = conn.execute(
+            "SELECT level, level_name, xp FROM identity_levels WHERE domain = ?",
+            (domain,),
+        ).fetchone()
+        _diag(
+            "xp.identity.update_complete",
+            domain=domain,
+            rows_updated=getattr(update_cur, "rowcount", None),
+            before_level=(before["level"] if before else None),
+            before_name=(before["level_name"] if before else None),
+            before_xp=(before["xp"] if before else None),
+            after_level=(after["level"] if after else None),
+            after_name=(after["level_name"] if after else None),
+            after_xp=(after["xp"] if after else None),
+        )
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _diag("xp.identity.update_error", domain=domain, new_level=new_level, new_name=new_name, error=exc)
+        raise
+    finally:
+        conn.close()
 
 def get_overall_level() -> Dict[str, Any]:
     """Get overall level across all domains."""
     key = ("get_overall_level",)
 
     def _load():
+        _diag("xp.overall.load_start")
         conn = get_connection()
         total_xp = conn.execute(
             """
@@ -2814,7 +3193,7 @@ def get_overall_level() -> Dict[str, Any]:
             last_milestone_level = None
             last_milestone_reward = None
 
-        return {
+        result = {
             'level': level,
             'name': f"Level {level}",
             'total_xp': total,
@@ -2836,6 +3215,16 @@ def get_overall_level() -> Dict[str, Any]:
                 'total_rewards_value': total_rewards_value
             }
         }
+        _diag(
+            "xp.overall.load_complete",
+            total_xp=total,
+            level=level,
+            xp_in_level=xp_in_level,
+            xp_to_next_milestone=xp_to_next_milestone,
+            next_milestone_level=next_milestone_level,
+            next_milestone_reward=next_milestone_reward,
+        )
+        return result
 
     return _cached_read(key, _load)
 
