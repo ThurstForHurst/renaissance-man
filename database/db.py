@@ -1117,18 +1117,39 @@ def _write_behind_worker_loop():
         _WRITE_BEHIND_QUEUE.task_done()
 
 
+def _write_behind_pending_tasks() -> int:
+    try:
+        return int(getattr(_WRITE_BEHIND_QUEUE, "unfinished_tasks", 0))
+    except Exception:
+        return _WRITE_BEHIND_QUEUE.qsize()
+
+
 def _flush_write_behind_queue(timeout_seconds: float = 8.0):
     # Use a local import to avoid any global name shadowing edge cases.
     import time as _time
 
-    _diag("write_behind.flush_start", timeout_seconds=timeout_seconds, queue_size=_WRITE_BEHIND_QUEUE.qsize())
+    _diag(
+        "write_behind.flush_start",
+        timeout_seconds=timeout_seconds,
+        queue_size=_WRITE_BEHIND_QUEUE.qsize(),
+        pending_tasks=_write_behind_pending_tasks(),
+    )
     deadline = _time.time() + max(0.0, float(timeout_seconds))
     while _time.time() < deadline:
-        if _WRITE_BEHIND_QUEUE.empty():
-            _diag("write_behind.flush_complete", queue_size=0)
+        # `empty()` is not sufficient here because the worker removes a batch from the
+        # queue before the Postgres commit finishes. `unfinished_tasks` stays > 0 until
+        # the worker calls `task_done()` after the mirror write fully completes.
+        pending_tasks = _write_behind_pending_tasks()
+        if pending_tasks == 0:
+            _diag("write_behind.flush_complete", queue_size=_WRITE_BEHIND_QUEUE.qsize(), pending_tasks=0)
             return
         _time.sleep(0.05)
-    _diag("write_behind.flush_timeout", queue_size=_WRITE_BEHIND_QUEUE.qsize())
+    _diag(
+        "write_behind.flush_timeout",
+        queue_size=_WRITE_BEHIND_QUEUE.qsize(),
+        pending_tasks=_write_behind_pending_tasks(),
+        worker_alive=bool(_WRITE_BEHIND_THREAD and _WRITE_BEHIND_THREAD.is_alive()),
+    )
 
 
 def _prepare_local_cache_schema(local_conn):
@@ -3842,6 +3863,10 @@ def award_pending_routine_xp():
     
     # Get today in Brisbane timezone
     today_brisbane = get_brisbane_date()
+    retention_days = 30
+    retention_cutoff = (
+        date.fromisoformat(today_brisbane) - timedelta(days=max(0, retention_days - 1))
+    ).isoformat()
     
     # Find all submissions from yesterday or earlier
     pending = conn.execute("""
@@ -3876,17 +3901,17 @@ def award_pending_routine_xp():
         )
         awarded_count += 1
     
-    # Delete old submissions after awarding (keep today's)
+    # Keep a rolling 30-day history for troubleshooting and reporting.
     conn.execute("""
         DELETE FROM routine_submissions 
         WHERE date < ?
-    """, (today_brisbane,))
+    """, (retention_cutoff,))
     
-    # Delete old progress entries (keep today's)
+    # Keep routine checkbox history on the same retention window.
     conn.execute("""
         DELETE FROM daily_routine_progress 
         WHERE date < ?
-    """, (today_brisbane,))
+    """, (retention_cutoff,))
     
     conn.commit()
     conn.close()
