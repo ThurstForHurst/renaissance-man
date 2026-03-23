@@ -540,6 +540,21 @@ def _is_mutating_sql(query: str) -> bool:
     }
 
 
+def _is_pg_connection_error(exc: Exception) -> bool:
+    if psycopg2 is None:
+        return False
+    connection_error_types = tuple(
+        t for t in (
+            getattr(psycopg2, "OperationalError", None),
+            getattr(psycopg2, "InterfaceError", None),
+        )
+        if t is not None
+    )
+    if not connection_error_types:
+        return False
+    return isinstance(exc, connection_error_types)
+
+
 def _get_postgres_pool():
     global _PG_POOL, _PG_POOL_PID
     if psycopg2_pool is None:
@@ -580,6 +595,10 @@ def _get_postgres_pool():
             connect_timeout = int(os.getenv("PG_CONNECT_TIMEOUT", "10"))
             connect_retries = max(1, int(os.getenv("PG_CONNECT_RETRIES", "6")))
             retry_delay = max(1, int(os.getenv("PG_CONNECT_RETRY_DELAY", "5")))
+            keepalives = int(os.getenv("PG_KEEPALIVES", "1"))
+            keepalives_idle = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
+            keepalives_interval = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
+            keepalives_count = int(os.getenv("PG_KEEPALIVES_COUNT", "5"))
             last_exc = None
             _diag(
                 "pg.pool.create_start",
@@ -588,6 +607,10 @@ def _get_postgres_pool():
                 connect_timeout=connect_timeout,
                 connect_retries=connect_retries,
                 retry_delay=retry_delay,
+                keepalives=keepalives,
+                keepalives_idle=keepalives_idle,
+                keepalives_interval=keepalives_interval,
+                keepalives_count=keepalives_count,
             )
             for attempt in range(1, connect_retries + 1):
                 try:
@@ -598,6 +621,10 @@ def _get_postgres_pool():
                         DATABASE_URL,
                         connect_timeout=connect_timeout,
                         application_name="renaissance-man",
+                        keepalives=keepalives,
+                        keepalives_idle=keepalives_idle,
+                        keepalives_interval=keepalives_interval,
+                        keepalives_count=keepalives_count,
                     )
                     _PG_POOL_PID = current_pid
                     _diag("pg.pool.create_success", attempt=attempt)
@@ -671,8 +698,23 @@ class _PostgresConnection:
         self._pool = _get_postgres_pool()
         self._conn = self._pool.getconn()
         self._closed = False
+        self._discard_on_close = False
         self._has_pending_write = False
         self._mutated_tables: Set[str] = set()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        except Exception as exc:
+            _diag("pg.conn.healthcheck_failed", conn_id=id(self._conn), error=exc)
+            try:
+                self._pool.putconn(self._conn, close=True)
+            except Exception:
+                pass
+            self._conn = self._pool.getconn()
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
         _diag("pg.conn.open", conn_id=id(self._conn), verbose=True)
 
     def cursor(self, *args, **kwargs):
@@ -693,6 +735,9 @@ class _PostgresConnection:
                 pg_query = _adapt_query_for_postgres(query)
                 cur.execute(pg_query, params)
         except Exception as exc:
+            if _is_pg_connection_error(exc):
+                self._discard_on_close = True
+                _diag("pg.conn.mark_discard", conn_id=id(self._conn), reason="execute_connection_error", error=exc)
             _diag(
                 "sql.exec.pg.error",
                 query=_diag_query_head(query),
@@ -751,7 +796,13 @@ class _PostgresConnection:
             mutated_tables=",".join(sorted(self._mutated_tables)) if self._mutated_tables else "none",
             verbose=True,
         )
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except Exception as exc:
+            if _is_pg_connection_error(exc):
+                self._discard_on_close = True
+                _diag("pg.conn.mark_discard", conn_id=id(self._conn), reason="commit_connection_error", error=exc)
+            raise
         if self._has_pending_write:
             _invalidate_cached_reads(set(self._mutated_tables) or {"*"})
         self._has_pending_write = False
@@ -765,20 +816,35 @@ class _PostgresConnection:
             mutated_tables=",".join(sorted(self._mutated_tables)) if self._mutated_tables else "none",
             verbose=True,
         )
-        self._conn.rollback()
+        try:
+            self._conn.rollback()
+        except Exception as exc:
+            if _is_pg_connection_error(exc):
+                self._discard_on_close = True
+                _diag("pg.conn.mark_discard", conn_id=id(self._conn), reason="rollback_connection_error", error=exc)
+            raise
         self._has_pending_write = False
         self._mutated_tables.clear()
 
     def close(self):
         if self._closed:
             return
-        _diag("pg.conn.close", conn_id=id(self._conn), verbose=True)
+        _diag(
+            "pg.conn.close",
+            conn_id=id(self._conn),
+            discard=self._discard_on_close,
+            verbose=True,
+        )
         try:
             # Avoid returning connections with open transactions to the pool.
             self._conn.rollback()
-        except Exception:
-            pass
-        self._pool.putconn(self._conn)
+        except Exception as exc:
+            if _is_pg_connection_error(exc):
+                self._discard_on_close = True
+        try:
+            self._pool.putconn(self._conn, close=self._discard_on_close)
+        except Exception as exc:
+            _diag("pg.conn.putconn_error", conn_id=id(self._conn), error=exc)
         self._closed = True
 
     def __getattr__(self, name):
@@ -1015,6 +1081,22 @@ def _write_behind_worker_loop():
                         conn.rollback()
                     except Exception:
                         pass
+                if _is_pg_connection_error(exc):
+                    global _PG_POOL, _PG_POOL_PID
+                    with _PG_POOL_LOCK:
+                        if _PG_POOL is not None:
+                            _diag(
+                                "pg.pool.reset_after_connection_error",
+                                pool_pid=_PG_POOL_PID,
+                                current_pid=os.getpid(),
+                                error=exc,
+                            )
+                            try:
+                                _PG_POOL.closeall()
+                            except Exception:
+                                pass
+                            _PG_POOL = None
+                            _PG_POOL_PID = None
                 print(f"[write-behind] Postgres sync failed, retrying in {delay_seconds:.2f}s: {exc}")
                 _diag(
                     "write_behind.batch_retry",
@@ -1322,6 +1404,65 @@ def _ensure_postgres_performance_indexes(conn):
         conn.execute(stmt)
 
 
+def _ensure_postgres_id_defaults(conn):
+    """
+    Ensure integer/bigint `id` columns in Postgres have a sequence-backed default.
+    This repairs tables migrated from SQLite that ended up with NOT NULL id but no default.
+    """
+    _diag("pg.id_defaults.ensure_start")
+    conn.execute(
+        """
+        DO $$
+        DECLARE
+            rec record;
+            seq_name text;
+            max_id bigint;
+        BEGIN
+            FOR rec IN
+                SELECT
+                    cols.table_name
+                FROM information_schema.columns cols
+                JOIN information_schema.tables t
+                  ON t.table_schema = cols.table_schema
+                 AND t.table_name = cols.table_name
+                WHERE cols.table_schema = 'public'
+                  AND t.table_type = 'BASE TABLE'
+                  AND cols.column_name = 'id'
+                  AND cols.data_type IN ('smallint', 'integer', 'bigint')
+                  AND cols.column_default IS NULL
+            LOOP
+                seq_name := rec.table_name || '_id_seq';
+
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %I',
+                    seq_name
+                );
+
+                EXECUTE format(
+                    'ALTER TABLE %I ALTER COLUMN id SET DEFAULT nextval(%L)',
+                    rec.table_name,
+                    seq_name
+                );
+
+                EXECUTE format(
+                    'SELECT COALESCE(MAX(id), 0) FROM %I',
+                    rec.table_name
+                )
+                INTO max_id;
+
+                EXECUTE format(
+                    'SELECT setval(%L, %s, false)',
+                    seq_name,
+                    max_id + 1
+                );
+            END LOOP;
+        END
+        $$;
+        """
+    )
+    _diag("pg.id_defaults.ensure_complete")
+
+
 def _sync_postgres_sequences(conn):
     """Align Postgres sequences with current MAX(id) values to prevent duplicate-key inserts."""
     conn.execute(
@@ -1554,6 +1695,7 @@ def init_db():
     if USE_POSTGRES:
         conn = _PostgresConnection()
         bootstrap_updated = _bootstrap_postgres_if_needed(conn)
+        _ensure_postgres_id_defaults(conn)
         _ensure_identity_level_integrity(conn)
         _deactivate_orphan_routine_items(conn)
         _sync_postgres_sequences(conn)
