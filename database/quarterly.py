@@ -28,10 +28,17 @@ def _quarter_meta_for_date(on_date: date) -> Tuple[int, str, date, date]:
     return year, q, date(year, start_m, 1), date(year, end_m, end_d)
 
 
+def _next_quarter_start(cycle: Dict[str, Any]) -> date:
+    return date.fromisoformat(cycle["end_date"]) + timedelta(days=1)
+
+
 def _phase_for(cycle: Dict[str, Any], on_date: Optional[date] = None) -> str:
     now = on_date or _today()
+    start_date = date.fromisoformat(cycle["start_date"])
     execution_end = date.fromisoformat(cycle["execution_end_date"])
     end_date = date.fromisoformat(cycle["end_date"])
+    if now < start_date:
+        return "planning"
     # execution_end_date is treated as the first day of review, not the last day of execution.
     if now < execution_end:
         return "execution"
@@ -73,17 +80,16 @@ def _require_structural_edit(cycle_id: int, admin_override: bool = False):
     if admin_override:
         return
     snapshot = get_cycle_snapshot(cycle_id)
-    if snapshot["cycle"]["phase"] != "review":
-        raise ValueError("Structural editing is locked during execution phase.")
+    if not snapshot["cycle"]["can_structural_edit"]:
+        raise ValueError("Structural editing is only open for the next cycle during the current review window.")
 
 
 def _to_dicts(rows) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_or_create_current_cycle() -> Dict[str, Any]:
-    now = _today()
-    year, quarter, start_date, end_date = _quarter_meta_for_date(now)
+def get_or_create_cycle_for_date(on_date: date) -> Dict[str, Any]:
+    year, quarter, start_date, end_date = _quarter_meta_for_date(on_date)
     execution_end = start_date + timedelta(days=69)
     title = f"{quarter} {year}"
 
@@ -110,8 +116,26 @@ def get_or_create_current_cycle() -> Dict[str, Any]:
     return dict(row)
 
 
+def get_or_create_current_cycle() -> Dict[str, Any]:
+    return get_or_create_cycle_for_date(_today())
+
+
+def get_or_create_next_cycle(base_cycle: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    anchor = base_cycle or get_or_create_current_cycle()
+    return get_or_create_cycle_for_date(_next_quarter_start(anchor))
+
+
+def get_planning_cycle() -> Optional[Dict[str, Any]]:
+    current_cycle = get_or_create_current_cycle()
+    if _phase_for(current_cycle) != "review":
+        return None
+    return get_or_create_next_cycle(current_cycle)
+
+
 def get_cycles_history() -> List[Dict[str, Any]]:
-    get_or_create_current_cycle()
+    current_cycle = get_or_create_current_cycle()
+    if _phase_for(current_cycle) == "review":
+        get_or_create_next_cycle(current_cycle)
     conn = get_connection()
     rows = conn.execute(
         """
@@ -179,6 +203,17 @@ def _calc_measured_progress(goal: Dict[str, Any], conn) -> Dict[str, Any]:
     )
     baseline = float(goal["baseline_value"]) if goal["baseline_value"] is not None else None
     target = float(goal["target_value"]) if goal["target_value"] is not None else None
+    ordered_entries = sorted(entries, key=lambda item: (item["date"], int(item["id"])))
+    previous_value = None
+    deltas_by_id: Dict[int, Optional[float]] = {}
+    for entry in ordered_entries:
+        value = float(entry["value"])
+        deltas_by_id[int(entry["id"])] = None if previous_value is None else value - previous_value
+        entry["delta_from_baseline"] = None if baseline is None else value - baseline
+        previous_value = value
+    for entry in entries:
+        entry["delta_from_previous"] = deltas_by_id.get(int(entry["id"]))
+
     current = None
     if entries:
         current = float(entries[0]["value"])
@@ -187,6 +222,7 @@ def _calc_measured_progress(goal: Dict[str, Any], conn) -> Dict[str, Any]:
 
     progress_pct = 0.0
     net_change = None
+    gap_to_target = None
     if baseline is not None and target is not None and current is not None and baseline != target:
         total_gap = abs(target - baseline)
         if (goal.get("target_direction") or "increase") == "decrease":
@@ -195,12 +231,21 @@ def _calc_measured_progress(goal: Dict[str, Any], conn) -> Dict[str, Any]:
             advanced = current - baseline
         progress_pct = (advanced / total_gap) * 100.0
         net_change = current - baseline
+    if target is not None and current is not None:
+        gap_to_target = abs(target - current)
+
+    latest_delta = entries[0]["delta_from_previous"] if entries else None
+    if latest_delta is None and current is not None and baseline is not None:
+        latest_delta = current - baseline
 
     return {
         "entries": entries[:20],
         "current": current,
         "progress_pct": max(0.0, min(100.0, progress_pct)),
         "net_change": net_change,
+        "gap_to_target": gap_to_target,
+        "latest_delta": latest_delta,
+        "last_entry_date": entries[0]["date"] if entries else None,
     }
 
 
@@ -241,6 +286,7 @@ def _goal_with_derived(goal: Dict[str, Any], cycle: Dict[str, Any], conn) -> Dic
 
 def get_cycle_snapshot(cycle_id: Optional[int] = None) -> Dict[str, Any]:
     current_cycle = get_or_create_current_cycle()
+    planning_cycle = get_planning_cycle()
     chosen_cycle_id = cycle_id or current_cycle["id"]
 
     conn = get_connection()
@@ -252,8 +298,9 @@ def get_cycle_snapshot(cycle_id: Optional[int] = None) -> Dict[str, Any]:
     phase = _phase_for(cycle)
     cycle["phase"] = phase
     cycle["is_current"] = int(cycle["id"]) == int(current_cycle["id"])
-    cycle["is_read_only"] = phase == "complete" or not cycle["is_current"]
-    cycle["can_structural_edit"] = phase == "review" and cycle["is_current"]
+    cycle["is_planning_target"] = bool(planning_cycle and int(cycle["id"]) == int(planning_cycle["id"]))
+    cycle["is_read_only"] = phase == "complete" or not (cycle["is_current"] or cycle["is_planning_target"])
+    cycle["can_structural_edit"] = bool(cycle["is_planning_target"])
     cycle["can_progress_edit"] = phase in ("execution", "review") and cycle["is_current"]
 
     progress = _cycle_progress(cycle)
@@ -637,13 +684,33 @@ def log_measured_value(goal_id: int, value: float, entry_date: Optional[str] = N
         conn.close()
         raise ValueError("Progress updates are locked for this cycle.")
     log_date = entry_date or get_brisbane_date()
-    conn.execute(
+    existing_rows = conn.execute(
         """
-        INSERT INTO measured_goal_entries (goal_id, date, value, note)
-        VALUES (?, ?, ?, ?)
+        SELECT id
+        FROM measured_goal_entries
+        WHERE goal_id = ? AND date = ?
+        ORDER BY id DESC
         """,
-        (goal_id, log_date, float(value), (note or "").strip()),
-    )
+        (goal_id, log_date),
+    ).fetchall()
+    if existing_rows:
+        keep_id = int(existing_rows[0]["id"])
+        conn.execute(
+            "UPDATE measured_goal_entries SET value = ?, note = ? WHERE id = ?",
+            (float(value), (note or "").strip(), keep_id),
+        )
+        duplicate_ids = [int(row["id"]) for row in existing_rows[1:]]
+        if duplicate_ids:
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            conn.execute(f"DELETE FROM measured_goal_entries WHERE id IN ({placeholders})", duplicate_ids)
+    else:
+        conn.execute(
+            """
+            INSERT INTO measured_goal_entries (goal_id, date, value, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (goal_id, log_date, float(value), (note or "").strip()),
+        )
     conn.execute(
         "UPDATE cycle_goals SET current_value = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (float(value), goal_id),

@@ -5,6 +5,7 @@ import dash
 from dash import ALL, Input, Output, State, callback, ctx, dcc, html
 import dash_bootstrap_components as dbc
 
+from database.db import get_brisbane_date
 from database.quarterly import (
     add_cycle_goal,
     add_milestone,
@@ -13,6 +14,7 @@ from database.quarterly import (
     get_cycle_snapshot,
     get_cycles_history,
     get_or_create_current_cycle,
+    get_or_create_next_cycle,
     log_counter_delta,
     log_measured_value,
     log_recurring_value,
@@ -48,6 +50,10 @@ GOAL_TYPE_META = {
 }
 
 PHASE_META = {
+    "planning": {
+        "label": "Planning",
+        "summary": "Shape the next quarter now so execution can start cleanly on day one.",
+    },
     "execution": {
         "label": "Execution",
         "summary": "Run the plan, log progress, and keep the scope stable.",
@@ -93,6 +99,20 @@ def _goal_type_label(goal_type: str) -> str:
     return GOAL_TYPE_META.get(goal_type, {}).get("label", "Challenge")
 
 
+def _format_signed_number(value) -> str:
+    if value is None or value == "":
+        return "--"
+    try:
+        number = float(value)
+        if number > 0:
+            return f"+{number:g}"
+        if number < 0:
+            return f"{number:g}"
+        return "0"
+    except Exception:
+        return str(value)
+
+
 def _phase_badge(phase: str):
     meta = PHASE_META.get(phase, PHASE_META["complete"])
     return html.Span(meta["label"], className=f"quarterly-phase-badge quarterly-phase-{phase}")
@@ -117,7 +137,9 @@ def _segmented_progress(cycle: dict):
     review_bg = "#f5efe3" if show_review_tint else "#edf2f8"
     execution_bg = "#e4edf9"
 
-    if phase == "execution":
+    if phase == "planning":
+        phase_text = f"Planning window · Execution starts {_format_date(cycle['start_date'])}"
+    elif phase == "execution":
         phase_text = f"Week {current_week} of {total_weeks}"
     elif phase == "review":
         phase_text = f"Review window · Week {current_week} of {total_weeks}"
@@ -278,6 +300,23 @@ def _history_rows(items, empty_text: str):
     if not items:
         return html.Div(empty_text, className="quarterly-empty-log")
     return html.Div(items, className="quarterly-history-stack")
+
+
+def _resolve_workspace(selected_cycle_id: int | None):
+    current_cycle = get_or_create_current_cycle()
+    selected_snapshot = get_cycle_snapshot(selected_cycle_id or current_cycle["id"])
+    focus_snapshot = selected_snapshot
+    review_snapshot = None
+
+    if selected_snapshot["cycle"]["is_current"] and selected_snapshot["cycle"]["phase"] == "review":
+        review_snapshot = selected_snapshot
+        focus_snapshot = get_cycle_snapshot(get_or_create_next_cycle(selected_snapshot["cycle"])["id"])
+
+    return {
+        "selected": selected_snapshot,
+        "focus": focus_snapshot,
+        "review": review_snapshot,
+    }
 
 
 def _counter_card(goal: dict, can_progress: bool, can_structural: bool):
@@ -636,6 +675,12 @@ def _milestone_card(goal: dict, can_progress: bool, can_structural: bool):
 def _measured_card(goal: dict, can_progress: bool, can_structural: bool):
     derived = goal["derived"]
     entries = derived.get("entries", [])
+    latest_value = derived.get("current")
+    target_value = goal.get("target_value")
+    latest_delta = derived.get("latest_delta")
+    last_entry_date = derived.get("last_entry_date")
+    gap_to_target = derived.get("gap_to_target")
+    direction = (goal.get("target_direction") or "increase").title()
 
     return dbc.Card(
         dbc.CardBody(
@@ -654,60 +699,154 @@ def _measured_card(goal: dict, can_progress: bool, can_structural: bool):
                         ),
                         _challenge_metric(
                             "Current",
-                            _format_number(derived.get("current")),
+                            _format_number(latest_value),
                             goal.get("unit") or "Latest log",
                         ),
                         _challenge_metric(
                             "Target",
-                            _format_number(goal.get("target_value")),
+                            _format_number(target_value),
                             goal.get("unit") or "Quarter target",
                         ),
                         _challenge_metric(
-                            "Net Change",
-                            _format_number(derived.get("net_change")),
-                            goal.get("unit") or "From baseline",
+                            "Gap To Target",
+                            _format_number(gap_to_target),
+                            goal.get("unit") or f"{direction} gap",
                         ),
                     ],
                     className="quarterly-inline-stats",
                 ),
                 _goal_progress(
                     derived.get("progress_pct", 0.0),
-                    f"{(goal.get('target_direction') or 'increase').title()} toward target",
-                ),
-                dbc.InputGroup(
-                    [
-                        dbc.Input(
-                            id={"type": "quarterly-measured-input", "goal_id": goal["id"]},
-                            type="number",
-                            step=0.01,
-                            placeholder="Log value",
-                            disabled=not can_progress,
-                        ),
-                        dbc.Button(
-                            "Log",
-                            id={"type": "quarterly-measured-log-btn", "goal_id": goal["id"]},
-                            color="dark",
-                            disabled=not can_progress,
-                        ),
-                    ],
-                    size="sm",
-                    className="mb-2",
+                    f"{direction} toward target",
                 ),
                 html.Div(
                     [
-                        html.Div("Recent entries", className="quarterly-subsection-label"),
-                        _history_rows(
+                        html.Div("Measurement update", className="quarterly-subsection-label"),
+                        html.Div(
                             [
                                 html.Div(
                                     [
-                                        html.Span(_format_date(entry["date"]), className="quarterly-history-date"),
-                                        html.Span(f"{_format_number(entry['value'])} {goal.get('unit') or ''}".strip()),
+                                        html.Span("Latest reading", className="quarterly-measured-summary-label"),
+                                        html.Strong(
+                                            f"{_format_number(latest_value)} {goal.get('unit') or ''}".strip() or "--",
+                                            className="quarterly-measured-summary-value",
+                                        ),
+                                        html.Span(
+                                            (
+                                                f"Last logged {_format_date(last_entry_date)}"
+                                                if last_entry_date
+                                                else "No measurement logged yet"
+                                            ),
+                                            className="quarterly-measured-summary-detail",
+                                        ),
                                     ],
-                                    className="quarterly-history-row",
-                                )
-                                for entry in entries[:4]
+                                    className="quarterly-measured-summary-card",
+                                ),
+                                html.Div(
+                                    [
+                                        html.Span("Latest change", className="quarterly-measured-summary-label"),
+                                        html.Strong(
+                                            _format_signed_number(latest_delta),
+                                            className="quarterly-measured-summary-value",
+                                        ),
+                                        html.Span(
+                                            goal.get("unit") or "From the previous entry",
+                                            className="quarterly-measured-summary-detail",
+                                        ),
+                                    ],
+                                    className="quarterly-measured-summary-card",
+                                ),
                             ],
-                            "No entries logged yet.",
+                            className="quarterly-measured-summary-grid",
+                        ),
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        html.Small("Value", className="quarterly-form-label"),
+                                        dbc.Input(
+                                            id={"type": "quarterly-measured-input", "goal_id": goal["id"]},
+                                            type="number",
+                                            step=0.01,
+                                            value=latest_value,
+                                            placeholder="Latest value",
+                                            disabled=not can_progress,
+                                        ),
+                                    ],
+                                    md=4,
+                                ),
+                                dbc.Col(
+                                    [
+                                        html.Small("Date", className="quarterly-form-label"),
+                                        dbc.Input(
+                                            id={"type": "quarterly-measured-date", "goal_id": goal["id"]},
+                                            type="date",
+                                            value=get_brisbane_date(),
+                                            disabled=not can_progress,
+                                        ),
+                                    ],
+                                    md=4,
+                                ),
+                                dbc.Col(
+                                    [
+                                        html.Small("Context", className="quarterly-form-label"),
+                                        dbc.Input(
+                                            id={"type": "quarterly-measured-note", "goal_id": goal["id"]},
+                                            placeholder="Optional note",
+                                            disabled=not can_progress,
+                                        ),
+                                    ],
+                                    md=4,
+                                ),
+                            ],
+                            className="g-2",
+                        ),
+                        dbc.Button(
+                            "Save Measurement",
+                            id={"type": "quarterly-measured-log-btn", "goal_id": goal["id"]},
+                            color="dark",
+                            disabled=not can_progress,
+                            className="mt-3",
+                        ),
+                        html.Small(
+                            "Saving on the same date updates that day's reading instead of stacking duplicates.",
+                            className="quarterly-muted mt-2 d-block",
+                        ),
+                    ],
+                    className="quarterly-measured-panel mb-3",
+                ),
+                html.Div(
+                    [
+                        html.Div("Measurement history", className="quarterly-subsection-label"),
+                        html.Div(
+                            [
+                                html.Div("Date", className="quarterly-measured-table-head"),
+                                html.Div("Value", className="quarterly-measured-table-head"),
+                                html.Div("Change", className="quarterly-measured-table-head"),
+                                html.Div("Note", className="quarterly-measured-table-head"),
+                            ],
+                            className="quarterly-measured-table quarterly-measured-table-header",
+                        ),
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Div(_format_date(entry["date"]), className="quarterly-measured-table-date"),
+                                        html.Div(
+                                            f"{_format_number(entry['value'])} {goal.get('unit') or ''}".strip(),
+                                            className="quarterly-measured-table-value",
+                                        ),
+                                        html.Div(
+                                            _format_signed_number(entry.get("delta_from_previous")),
+                                            className="quarterly-measured-table-change",
+                                        ),
+                                        html.Div(entry.get("note") or "—", className="quarterly-measured-table-note"),
+                                    ],
+                                    className="quarterly-measured-table quarterly-measured-table-row",
+                                )
+                                for entry in entries[:6]
+                            ]
+                            or [html.Div("No entries logged yet.", className="quarterly-empty-log")],
                         ),
                     ]
                 ),
@@ -777,7 +916,12 @@ def _mode_row(label: str, detail: str, is_open: bool):
 
 def _workflow_card(cycle: dict, active_goal_count: int, note_count: int):
     phase_meta = PHASE_META.get(cycle["phase"], PHASE_META["complete"])
-    view_text = "Current quarter" if cycle["is_current"] else "Historical view"
+    if cycle.get("is_planning_target"):
+        view_text = "Planning target"
+    elif cycle["is_current"]:
+        view_text = "Current quarter"
+    else:
+        view_text = "Historical view"
     return dbc.Card(
         dbc.CardBody(
             [
@@ -786,12 +930,16 @@ def _workflow_card(cycle: dict, active_goal_count: int, note_count: int):
                 html.P(phase_meta["summary"], className="quarterly-muted mb-3"),
                 _mode_row(
                     "Challenge structure",
-                    "Change titles, order, and scope during review only.",
+                    "Design and tune the next quarter in the review handoff window."
+                    if cycle.get("is_planning_target")
+                    else "Change titles, order, and scope during the planning window only.",
                     cycle["can_structural_edit"],
                 ),
                 _mode_row(
                     "Progress tracking",
-                    "Log counters, compliance, milestones, and measurements when active.",
+                    "Progress opens when the cycle becomes active."
+                    if cycle["phase"] == "planning"
+                    else "Log counters, compliance, milestones, and measurements when active.",
                     cycle["can_progress_edit"],
                 ),
                 _mode_row("Review notes", "Capture decisions and reflections at any time.", True),
@@ -827,11 +975,18 @@ def _goal_type_directory():
 
 def _empty_state(cycle: dict):
     if not cycle["is_current"]:
-        title = "No challenges were recorded for this cycle."
-        copy = "This historical quarter is empty, but it stays available for reference."
+        if cycle.get("is_planning_target"):
+            title = f"No challenges are planned for {cycle['title']} yet."
+            copy = "Use this window to keep the next quarter lean, specific, and ready to execute."
+        else:
+            title = "No challenges were recorded for this cycle."
+            copy = "This historical quarter is empty, but it stays available for reference."
     elif cycle["can_structural_edit"]:
         title = "This quarter has no challenges yet."
         copy = "You are in review right now, so this is the moment to define the few commitments that matter."
+    elif cycle["phase"] == "review":
+        title = "No challenges are left in this review snapshot."
+        copy = "Use the planning board for next-quarter setup and keep this area for final reflections or late progress only."
     elif cycle["can_progress_edit"]:
         title = "No challenges are set for this quarter."
         copy = "Execution is underway, so structure is locked. Use review notes to shape the next cycle."
@@ -854,16 +1009,31 @@ def _empty_state(cycle: dict):
 
 def _add_goal_panel(cycle: dict):
     disabled = not cycle["can_structural_edit"]
+    plan_title = f"Plan {cycle['title']}" if cycle.get("is_planning_target") else "Add Challenge"
+    plan_copy = (
+        f"Anything you create here will belong to {cycle['title']}. Keep the list tight and execution-ready."
+        if cycle.get("is_planning_target")
+        else "Review mode is open, so you can design or tighten the quarter."
+        if not disabled
+        else "Challenge setup opens during the planning window. The form stays visible here so the workflow remains clear."
+    )
+
     return dbc.Card(
         dbc.CardBody(
             [
                 html.Div("Challenge builder", className="quarterly-side-eyebrow"),
-                html.H5("Add Challenge", className="mb-1"),
-                html.P(
-                    "Review mode is open, so you can design or tighten the quarter."
-                    if not disabled
-                    else "Challenge setup opens during review. The form stays visible here so the workflow remains clear.",
-                    className="quarterly-muted mb-3",
+                html.H5(plan_title, className="mb-1"),
+                html.P(plan_copy, className="quarterly-muted mb-3"),
+                html.Div(
+                    [
+                        html.Span("Target quarter", className="quarterly-builder-kicker"),
+                        html.Strong(cycle["title"], className="quarterly-builder-quarter"),
+                        html.Span(
+                            f"{_format_date(cycle['start_date'])} to {_format_date(cycle['end_date'])}",
+                            className="quarterly-builder-window",
+                        ),
+                    ],
+                    className="quarterly-builder-target mb-3",
                 ),
                 dbc.Row(
                     [
@@ -876,11 +1046,39 @@ def _add_goal_panel(cycle: dict):
                                     disabled=disabled,
                                 ),
                             ],
-                            md=7,
+                            md=8,
                         ),
                         dbc.Col(
                             [
-                                html.Small("Tracking method", className="quarterly-form-label"),
+                                html.Small("Theme", className="quarterly-form-label"),
+                                dbc.Input(
+                                    id="quarterly-add-category",
+                                    placeholder="Optional grouping",
+                                    disabled=disabled,
+                                ),
+                            ],
+                            md=4,
+                        ),
+                    ],
+                    className="g-2 mb-3",
+                ),
+                html.Div(
+                    [
+                        html.Small("Definition of done", className="quarterly-form-label"),
+                        dbc.Textarea(
+                            id="quarterly-add-description",
+                            placeholder="What will be true if this quarter is a success?",
+                            className="mb-3",
+                            disabled=disabled,
+                            style={"minHeight": "88px"},
+                        ),
+                    ]
+                ),
+                dbc.Row(
+                    [
+                        dbc.Col(
+                            [
+                                html.Small("Tracking style", className="quarterly-form-label"),
                                 dcc.Dropdown(
                                     id="quarterly-add-type",
                                     options=[
@@ -893,30 +1091,24 @@ def _add_goal_panel(cycle: dict):
                                     className="quarterly-dropdown",
                                 ),
                             ],
-                            md=5,
+                            md=6,
+                        ),
+                        dbc.Col(
+                            [
+                                html.Div(id="quarterly-add-type-help", className="quarterly-type-help h-100"),
+                            ],
+                            md=6,
                         ),
                     ],
                     className="g-2 mb-3",
                 ),
-                html.Div(id="quarterly-add-type-help", className="quarterly-type-help mb-3"),
-                html.Div(
-                    [
-                        html.Small("Description", className="quarterly-form-label"),
-                        dbc.Textarea(
-                            id="quarterly-add-description",
-                            placeholder="What would successful execution look like?",
-                            className="mb-3",
-                            disabled=disabled,
-                            style={"minHeight": "88px"},
-                        ),
-                    ]
-                ),
+                html.Div(id="quarterly-add-plan-preview", className="quarterly-builder-preview mb-3"),
                 html.Div(
                     dbc.Row(
                         [
                             dbc.Col(
                                 [
-                                    html.Small("Target", className="quarterly-form-label"),
+                                    html.Small(id="quarterly-add-target-label", className="quarterly-form-label"),
                                     dbc.Input(
                                         id="quarterly-add-target",
                                         type="number",
@@ -928,7 +1120,7 @@ def _add_goal_panel(cycle: dict):
                             ),
                             dbc.Col(
                                 [
-                                    html.Small("Starting / current", className="quarterly-form-label"),
+                                    html.Small(id="quarterly-add-current-label", className="quarterly-form-label"),
                                     dbc.Input(
                                         id="quarterly-add-current",
                                         type="number",
@@ -943,7 +1135,7 @@ def _add_goal_panel(cycle: dict):
                                     html.Small("Unit", className="quarterly-form-label"),
                                     dbc.Input(
                                         id="quarterly-add-unit",
-                                        placeholder="kg, books, sessions, etc.",
+                                        placeholder="kg, books, sessions, sessions/week",
                                         disabled=disabled,
                                     ),
                                 ],
@@ -960,7 +1152,7 @@ def _add_goal_panel(cycle: dict):
                         [
                             dbc.Col(
                                 [
-                                    html.Small("Baseline", className="quarterly-form-label"),
+                                    html.Small(id="quarterly-add-baseline-label", className="quarterly-form-label"),
                                     dbc.Input(
                                         id="quarterly-add-baseline",
                                         type="number",
@@ -1001,33 +1193,6 @@ def _add_goal_panel(cycle: dict):
                     id="quarterly-add-direction-row",
                     className="mb-3",
                 ),
-                dbc.Row(
-                    [
-                        dbc.Col(
-                            [
-                                html.Small("Category", className="quarterly-form-label"),
-                                dbc.Input(
-                                    id="quarterly-add-category",
-                                    placeholder="Optional grouping",
-                                    disabled=disabled,
-                                ),
-                            ],
-                            md=5,
-                        ),
-                        dbc.Col(
-                            [
-                                html.Small("Setup notes", className="quarterly-form-label"),
-                                dbc.Input(
-                                    id="quarterly-add-notes",
-                                    placeholder="Guardrails, scope, or reminders",
-                                    disabled=disabled,
-                                ),
-                            ],
-                            md=7,
-                        ),
-                    ],
-                    className="g-2 mb-3",
-                ),
                 html.Div(
                     [
                         html.Small("Milestones", className="quarterly-form-label"),
@@ -1043,8 +1208,20 @@ def _add_goal_panel(cycle: dict):
                     id="quarterly-add-milestone-wrap",
                     className="mb-3",
                 ),
+                html.Div(
+                    [
+                        html.Small("Execution note", className="quarterly-form-label"),
+                        dbc.Textarea(
+                            id="quarterly-add-notes",
+                            placeholder="Guardrails, scope boundaries, or reminders for later execution",
+                            disabled=disabled,
+                            style={"minHeight": "78px"},
+                        ),
+                    ],
+                    className="mb-3",
+                ),
                 dbc.Button(
-                    "Save Challenge",
+                    f"Add To {cycle['title']}" if cycle.get("is_planning_target") else "Save Challenge",
                     id="quarterly-add-goal-btn",
                     color="dark",
                     disabled=disabled,
@@ -1056,16 +1233,13 @@ def _add_goal_panel(cycle: dict):
     )
 
 
-def _notes_panel(notes: list):
+def _notes_panel(notes: list, title: str = "Review Notes", copy: str = "Capture lessons, scope changes, and what should carry into the next quarter."):
     return dbc.Card(
         dbc.CardBody(
             [
                 html.Div("Reflection log", className="quarterly-side-eyebrow"),
-                html.H5("Review Notes", className="mb-1"),
-                html.P(
-                    "Capture lessons, scope changes, and what should carry into the next quarter.",
-                    className="quarterly-muted mb-3",
-                ),
+                html.H5(title, className="mb-1"),
+                html.P(copy, className="quarterly-muted mb-3"),
                 dbc.Textarea(
                     id="quarterly-note-input",
                     placeholder="Add a review note",
@@ -1101,7 +1275,12 @@ def _cycle_metrics(cycle: dict, goals: list):
     active_goals = [goal for goal in goals if not goal["is_archived"]]
     archived_goals = [goal for goal in goals if goal["is_archived"]]
 
-    if cycle["phase"] == "execution":
+    if cycle["phase"] == "planning":
+        boundary_label = "Execution starts"
+        boundary_value = _format_date(cycle["start_date"])
+        boundary_detail = "Use the current review window to lock the plan"
+        tone = "accent"
+    elif cycle["phase"] == "execution":
         boundary_label = "Review starts"
         boundary_value = _format_date(cycle["execution_end_date"])
         boundary_detail = "Structural edits open then"
@@ -1159,10 +1338,56 @@ def _cycle_metrics(cycle: dict, goals: list):
     )
 
 
-def _quarter_header(cycle: dict):
-    review_start = _format_date(cycle["execution_end_date"])
-    date_window = f"{_format_date(cycle['start_date'])} to {_format_date(cycle['end_date'])}"
-    phase_copy = PHASE_META.get(cycle["phase"], PHASE_META["complete"])["summary"]
+def _quarter_header(cycle: dict, review_cycle: dict | None = None):
+    if review_cycle:
+        review_window = f"{_format_date(review_cycle['start_date'])} to {_format_date(review_cycle['end_date'])}"
+        plan_window = f"{_format_date(cycle['start_date'])} to {_format_date(cycle['end_date'])}"
+        phase_copy = (
+            f"{review_cycle['title']} is in review now. Anything you plan below belongs to {cycle['title']}, "
+            "so the next quarter is ready before execution starts."
+        )
+        mandate_hint = f"{cycle['title']} execution starts on {_format_date(cycle['start_date'])}."
+        eyebrow = "Review handoff"
+        title = f"{review_cycle['title']} review -> {cycle['title']} plan"
+        badge = html.Div(
+            [_phase_badge(review_cycle["phase"]), _phase_badge(cycle["phase"])],
+            className="quarterly-badge-stack",
+        )
+        progress = _segmented_progress(review_cycle)
+        side_panel = html.Div(
+            [
+                html.Span("Closing quarter", className="quarterly-handoff-kicker"),
+                html.Strong(review_cycle["title"], className="quarterly-handoff-title"),
+                html.Span(review_window, className="quarterly-handoff-window"),
+                html.Hr(className="quarterly-handoff-divider"),
+                html.Span("Planning target", className="quarterly-handoff-kicker"),
+                html.Strong(cycle["title"], className="quarterly-handoff-title"),
+                html.Span(plan_window, className="quarterly-handoff-window"),
+            ],
+            className="quarterly-handoff-panel",
+        )
+        mandate_label = f"{cycle['title']} mandate"
+    else:
+        review_start = _format_date(cycle["execution_end_date"])
+        date_window = f"{_format_date(cycle['start_date'])} to {_format_date(cycle['end_date'])}"
+        phase_copy = PHASE_META.get(cycle["phase"], PHASE_META["complete"])["summary"]
+        mandate_hint = (
+            f"Execution window flips into review on {review_start}."
+            if cycle["phase"] != "planning"
+            else f"Execution starts on {_format_date(cycle['start_date'])}."
+        )
+        eyebrow = (
+            "Current cycle"
+            if cycle["is_current"]
+            else "Planning target"
+            if cycle.get("is_planning_target")
+            else "Selected cycle"
+        )
+        title = cycle["title"]
+        badge = _phase_badge(cycle["phase"])
+        progress = _segmented_progress(cycle)
+        side_panel = html.Div(date_window, className="quarterly-muted")
+        mandate_label = "Quarter mandate"
 
     mandate_placeholder = (
         "Use this note to define the quarter's focus, boundaries, and standard for success."
@@ -1177,26 +1402,23 @@ def _quarter_header(cycle: dict):
                     [
                         html.Div(
                             [
-                                html.Div("Current cycle" if cycle["is_current"] else "Selected cycle", className="quarterly-side-eyebrow"),
-                                html.H3(cycle["title"], className="mb-1"),
-                                html.Div(date_window, className="quarterly-muted"),
+                                html.Div(eyebrow, className="quarterly-side-eyebrow"),
+                                html.H3(title, className="mb-1"),
+                                side_panel,
                             ]
                         ),
-                        _phase_badge(cycle["phase"]),
+                        badge,
                     ],
                     className="quarterly-header-top",
                 ),
                 html.P(phase_copy, className="quarterly-header-copy"),
-                _segmented_progress(cycle),
+                progress,
                 html.Div(
                     [
                         html.Div(
                             [
-                                html.Div("Quarter mandate", className="quarterly-subsection-label"),
-                                html.Div(
-                                    f"Execution window flips into review on {review_start}.",
-                                    className="quarterly-muted mb-2",
-                                ),
+                                html.Div(mandate_label, className="quarterly-subsection-label"),
+                                html.Div(mandate_hint, className="quarterly-muted mb-2"),
                                 dbc.Textarea(
                                     id="quarterly-summary-note",
                                     value=cycle.get("summary_note") or "",
@@ -1224,7 +1446,7 @@ def _quarter_header(cycle: dict):
                     color="secondary",
                     className="mt-3 mb-0",
                 )
-                if not cycle["is_current"]
+                if not cycle["is_current"] and not cycle.get("is_planning_target") and not review_cycle
                 else None,
             ]
         ),
@@ -1232,62 +1454,125 @@ def _quarter_header(cycle: dict):
     )
 
 
-def _build_cycle_options(cycles: list, current_cycle_id: int):
-    options = []
-    for cycle in cycles:
-        suffix = "Current" if int(cycle["id"]) == int(current_cycle_id) else "History"
-        options.append({"label": f"{cycle['title']} · {suffix}", "value": cycle["id"]})
-    return options
-
-
-def _render_cycle_content(cycle_id: int):
-    snapshot = get_cycle_snapshot(cycle_id)
-    cycle, goals, notes = snapshot["cycle"], snapshot["goals"], snapshot["notes"]
+def _challenge_board(cycle: dict, goals: list, title: str, copy: str):
     active_goals = [goal for goal in goals if not goal["is_archived"]]
     archived_goals = [goal for goal in goals if goal["is_archived"]]
 
     return html.Div(
         [
-            _quarter_header(cycle),
+            html.Div(
+                [
+                    html.Div("Challenge board", className="quarterly-side-eyebrow"),
+                    html.H4(title, className="mb-1"),
+                    html.P(copy, className="quarterly-muted mb-3"),
+                ]
+            ),
+            html.Div(
+                [_render_goal_card(goal, cycle) for goal in active_goals],
+                className="quarterly-goal-stack",
+            )
+            if active_goals
+            else _empty_state(cycle),
+            html.Details(
+                [
+                    html.Summary(
+                        [
+                            html.Span("Archived challenges", className="quarterly-details-title"),
+                            html.Span(str(len(archived_goals)), className="quarterly-details-count"),
+                        ],
+                        className="quarterly-details-summary",
+                    ),
+                    html.Div(
+                        [_render_goal_card(goal, cycle) for goal in archived_goals],
+                        className="quarterly-goal-stack quarterly-archived-stack",
+                    )
+                    if archived_goals
+                    else html.Div("No archived challenges.", className="quarterly-empty-log"),
+                ],
+                className="quarterly-details-card mt-3",
+            ),
+        ]
+    )
+
+
+def _review_snapshot_panel(review_snapshot: dict):
+    review_cycle = review_snapshot["cycle"]
+    review_goals = review_snapshot["goals"]
+    active_goals = [goal for goal in review_goals if not goal["is_archived"]]
+
+    return html.Details(
+        [
+            html.Summary(
+                [
+                    html.Span(f"{review_cycle['title']} review snapshot", className="quarterly-details-title"),
+                    html.Span(str(len(active_goals)), className="quarterly-details-count"),
+                ],
+                className="quarterly-details-summary",
+            ),
+            html.Div(
+                [
+                    dbc.Alert(
+                        "Late progress updates still belong here, but anything new you plan now should live in the next quarter board above.",
+                        color="light",
+                        className="mb-3 quarterly-review-alert",
+                    ),
+                    _challenge_board(
+                        review_cycle,
+                        review_goals,
+                        f"{review_cycle['title']} wrap-up",
+                        "Keep this view for review and final logging. Structural planning has shifted to the next cycle.",
+                    ),
+                ],
+                className="quarterly-history-browser-body",
+            ),
+        ],
+        className="quarterly-details-card mt-3",
+    )
+
+
+def _build_cycle_options(cycles: list, current_cycle_id: int, planning_cycle_id: int | None = None):
+    options = []
+    for cycle in cycles:
+        if int(cycle["id"]) == int(current_cycle_id):
+            suffix = "Current"
+        elif planning_cycle_id and int(cycle["id"]) == int(planning_cycle_id):
+            suffix = "Next"
+        else:
+            suffix = "History"
+        options.append({"label": f"{cycle['title']} · {suffix}", "value": cycle["id"]})
+    return options
+
+
+def _render_cycle_content(cycle_id: int):
+    workspace = _resolve_workspace(cycle_id)
+    focus_snapshot = workspace["focus"]
+    review_snapshot = workspace["review"]
+    notes_snapshot = workspace["selected"]
+    cycle, goals, notes = focus_snapshot["cycle"], focus_snapshot["goals"], notes_snapshot["notes"]
+    active_goals = [goal for goal in goals if not goal["is_archived"]]
+    board_title = f"{cycle['title']} plan" if cycle.get("is_planning_target") else "Quarter Challenges"
+    board_copy = (
+        "Anything you define here is queued for the next quarter. Keep the commitments tight and unambiguous."
+        if cycle.get("is_planning_target")
+        else "A tight set of quarter commitments with one tracking method per challenge."
+    )
+    note_title = "Review Notes" if not review_snapshot else f"{review_snapshot['cycle']['title']} review notes"
+    note_copy = (
+        "Capture lessons, scope changes, and what should carry into the next quarter."
+        if not review_snapshot
+        else "Use this log to close out the current quarter while the next one is being planned."
+    )
+
+    return html.Div(
+        [
+            _quarter_header(cycle, review_cycle=review_snapshot["cycle"] if review_snapshot else None),
             _cycle_metrics(cycle, goals),
             dbc.Row(
                 [
                     dbc.Col(
                         [
-                            html.Div(
-                                [
-                                    html.Div("Challenge board", className="quarterly-side-eyebrow"),
-                                    html.H4("Quarter Challenges", className="mb-1"),
-                                    html.P(
-                                        "A tight set of quarter commitments with one tracking method per challenge.",
-                                        className="quarterly-muted mb-3",
-                                    ),
-                                ]
-                            ),
-                            html.Div(
-                                [_render_goal_card(goal, cycle) for goal in active_goals],
-                                className="quarterly-goal-stack",
-                            )
-                            if active_goals
-                            else _empty_state(cycle),
-                            html.Details(
-                                [
-                                    html.Summary(
-                                        [
-                                            html.Span("Archived challenges", className="quarterly-details-title"),
-                                            html.Span(str(len(archived_goals)), className="quarterly-details-count"),
-                                        ],
-                                        className="quarterly-details-summary",
-                                    ),
-                                    html.Div(
-                                        [_render_goal_card(goal, cycle) for goal in archived_goals],
-                                        className="quarterly-goal-stack quarterly-archived-stack",
-                                    )
-                                    if archived_goals
-                                    else html.Div("No archived challenges.", className="quarterly-empty-log"),
-                                ],
-                                className="quarterly-details-card mt-3",
-                            ),
+                            _challenge_board(cycle, goals, board_title, board_copy),
+                            _review_snapshot_panel(review_snapshot) if review_snapshot else None,
                         ],
                         lg=8,
                     ),
@@ -1295,7 +1580,7 @@ def _render_cycle_content(cycle_id: int):
                         [
                             _workflow_card(cycle, len(active_goals), len(notes)),
                             _add_goal_panel(cycle),
-                            _notes_panel(notes),
+                            _notes_panel(notes, title=note_title, copy=note_copy),
                         ],
                         lg=4,
                     ),
@@ -1308,8 +1593,10 @@ def _render_cycle_content(cycle_id: int):
 
 def layout():
     current = get_or_create_current_cycle()
+    current_snapshot = get_cycle_snapshot(current["id"])
     cycles = get_cycles_history()
-    options = _build_cycle_options(cycles, current["id"])
+    planning_cycle_id = get_or_create_next_cycle(current)["id"] if current_snapshot["cycle"]["phase"] == "review" else None
+    options = _build_cycle_options(cycles, current["id"], planning_cycle_id)
 
     return dbc.Container(
         [
@@ -1353,6 +1640,8 @@ def layout():
             ),
             html.Div(id="quarterly-message", className="quarterly-message-slot mb-3"),
             dcc.Store(id="quarterly-refresh", data=0),
+            dcc.Store(id="quarterly-focus-cycle-id", data=planning_cycle_id or current["id"]),
+            dcc.Store(id="quarterly-note-cycle-id", data=current["id"]),
             html.Div(id="quarterly-content", children=_render_cycle_content(current["id"])),
         ],
         fluid=True,
@@ -1366,8 +1655,10 @@ def layout():
 )
 def refresh_quarterly_options(_refresh):
     current = get_or_create_current_cycle()
+    current_snapshot = get_cycle_snapshot(current["id"])
     cycles = get_cycles_history()
-    return _build_cycle_options(cycles, current["id"])
+    planning_cycle_id = get_or_create_next_cycle(current)["id"] if current_snapshot["cycle"]["phase"] == "review" else None
+    return _build_cycle_options(cycles, current["id"], planning_cycle_id)
 
 
 @callback(
@@ -1381,11 +1672,29 @@ def refresh_quarterly_content(selected_cycle_id, _refresh):
 
 
 @callback(
+    Output("quarterly-focus-cycle-id", "data"),
+    Output("quarterly-note-cycle-id", "data"),
+    Input("quarterly-cycle-select", "value"),
+    Input("quarterly-refresh", "data"),
+)
+def sync_quarterly_workspace_ids(selected_cycle_id, _refresh):
+    workspace = _resolve_workspace(selected_cycle_id)
+    return workspace["focus"]["cycle"]["id"], workspace["selected"]["cycle"]["id"]
+
+
+@callback(
     Output("quarterly-add-type-help", "children"),
+    Output("quarterly-add-plan-preview", "children"),
     Output("quarterly-add-value-row", "style"),
     Output("quarterly-add-baseline-wrap", "style"),
     Output("quarterly-add-direction-row", "style"),
     Output("quarterly-add-milestone-wrap", "style"),
+    Output("quarterly-add-target-label", "children"),
+    Output("quarterly-add-current-label", "children"),
+    Output("quarterly-add-baseline-label", "children"),
+    Output("quarterly-add-target", "placeholder"),
+    Output("quarterly-add-current", "placeholder"),
+    Output("quarterly-add-baseline", "placeholder"),
     Input("quarterly-add-type", "value"),
 )
 def sync_add_goal_form(goal_type):
@@ -1405,14 +1714,53 @@ def sync_add_goal_form(goal_type):
     baseline_style = visible if cleaned == "measured" else hidden
     direction_style = visible if cleaned == "measured" else hidden
     milestone_style = visible if cleaned == "milestone" else hidden
-    return help_box, value_row_style, baseline_style, direction_style, milestone_style
+
+    preview_copy = {
+        "counter": "Plan one running total for the full quarter, then update it as the work accumulates.",
+        "binary_recurring": "Plan a daily yes-or-no commitment that you can mark quickly without interpretation.",
+        "milestone": "Plan a short list of checkpoints so progress feels obvious and reviewable.",
+        "measured": "Plan a metric that should move from a baseline to a target over the quarter.",
+    }.get(cleaned, meta["summary"])
+
+    field_labels = {
+        "counter": ("Quarter target", "Starting count", "Baseline", "Target total", "Current starting point", "Baseline"),
+        "binary_recurring": ("Target", "Current", "Baseline", "Target", "Current", "Baseline"),
+        "milestone": ("Target", "Current", "Baseline", "Target", "Current", "Baseline"),
+        "measured": ("Target value", "Latest known value", "Baseline at start", "Target reading", "Current reading", "Baseline reading"),
+    }
+    target_label, current_label, baseline_label, target_placeholder, current_placeholder, baseline_placeholder = field_labels.get(
+        cleaned,
+        field_labels["counter"],
+    )
+
+    preview_box = html.Div(
+        [
+            html.Span("How this will work", className="quarterly-builder-preview-title"),
+            html.Span(preview_copy, className="quarterly-builder-preview-copy"),
+        ]
+    )
+
+    return (
+        help_box,
+        preview_box,
+        value_row_style,
+        baseline_style,
+        direction_style,
+        milestone_style,
+        target_label,
+        current_label,
+        baseline_label,
+        target_placeholder,
+        current_placeholder,
+        baseline_placeholder,
+    )
 
 
 @callback(
     Output("quarterly-message", "children", allow_duplicate=True),
     Output("quarterly-refresh", "data", allow_duplicate=True),
     Input("quarterly-add-goal-btn", "n_clicks"),
-    State("quarterly-cycle-select", "value"),
+    State("quarterly-focus-cycle-id", "data"),
     State("quarterly-add-title", "value"),
     State("quarterly-add-type", "value"),
     State("quarterly-add-description", "value"),
@@ -1461,7 +1809,8 @@ def handle_add_goal(
             notes=notes or "",
             milestones=milestones,
         )
-        return dbc.Alert("Challenge added.", color="success", duration=2500), (refresh_count or 0) + 1
+        cycle_title = get_cycle_snapshot(int(cycle_id))["cycle"]["title"]
+        return dbc.Alert(f"Challenge added to {cycle_title}.", color="success", duration=2500), (refresh_count or 0) + 1
     except Exception as exc:
         return dbc.Alert(str(exc), color="danger"), dash.no_update
 
@@ -1510,8 +1859,6 @@ def handle_binary_updates(_yes, _no, refresh_count):
     if not triggered:
         return dash.no_update, dash.no_update
     try:
-        from database.db import get_brisbane_date
-
         log_recurring_value(int(triggered["goal_id"]), get_brisbane_date(), triggered["type"] == "quarterly-binary-yes")
         return dbc.Alert("Recurring status saved.", color="success", duration=1500), (refresh_count or 0) + 1
     except Exception as exc:
@@ -1607,20 +1954,31 @@ def handle_milestone_structure(
     Input({"type": "quarterly-measured-log-btn", "goal_id": ALL}, "n_clicks"),
     State({"type": "quarterly-measured-input", "goal_id": ALL}, "value"),
     State({"type": "quarterly-measured-input", "goal_id": ALL}, "id"),
+    State({"type": "quarterly-measured-date", "goal_id": ALL}, "value"),
+    State({"type": "quarterly-measured-date", "goal_id": ALL}, "id"),
+    State({"type": "quarterly-measured-note", "goal_id": ALL}, "value"),
+    State({"type": "quarterly-measured-note", "goal_id": ALL}, "id"),
     State("quarterly-refresh", "data"),
     prevent_initial_call=True,
 )
-def handle_measured_logs(_log_clicks, values, ids, refresh_count):
+def handle_measured_logs(_log_clicks, values, ids, dates, date_ids, notes, note_ids, refresh_count):
     triggered = ctx.triggered_id
     if not triggered:
         return dash.no_update, dash.no_update
     try:
         goal_id = int(triggered["goal_id"])
-        mapping = {int(item["goal_id"]): value for item, value in zip(ids or [], values or [])}
-        if goal_id not in mapping or mapping[goal_id] is None:
+        value_map = {int(item["goal_id"]): value for item, value in zip(ids or [], values or [])}
+        date_map = {int(item["goal_id"]): value for item, value in zip(date_ids or [], dates or [])}
+        note_map = {int(item["goal_id"]): value for item, value in zip(note_ids or [], notes or [])}
+        if goal_id not in value_map or value_map[goal_id] is None:
             return dbc.Alert("Enter a value before logging.", color="warning", duration=1600), dash.no_update
-        log_measured_value(goal_id, float(mapping[goal_id]))
-        return dbc.Alert("Measurement logged.", color="success", duration=1500), (refresh_count or 0) + 1
+        log_measured_value(
+            goal_id,
+            float(value_map[goal_id]),
+            entry_date=date_map.get(goal_id) or None,
+            note=note_map.get(goal_id) or "",
+        )
+        return dbc.Alert("Measurement saved.", color="success", duration=1500), (refresh_count or 0) + 1
     except Exception as exc:
         return dbc.Alert(str(exc), color="danger"), dash.no_update
 
@@ -1655,7 +2013,7 @@ def handle_goal_structure(_up, _down, _archive, refresh_count):
     Output("quarterly-message", "children", allow_duplicate=True),
     Output("quarterly-refresh", "data", allow_duplicate=True),
     Input("quarterly-save-note-btn", "n_clicks"),
-    State("quarterly-cycle-select", "value"),
+    State("quarterly-note-cycle-id", "data"),
     State("quarterly-note-input", "value"),
     State("quarterly-refresh", "data"),
     prevent_initial_call=True,
@@ -1674,7 +2032,7 @@ def handle_save_note(n_clicks, cycle_id, note, refresh_count):
     Output("quarterly-message", "children", allow_duplicate=True),
     Output("quarterly-refresh", "data", allow_duplicate=True),
     Input("quarterly-save-summary-note-btn", "n_clicks"),
-    State("quarterly-cycle-select", "value"),
+    State("quarterly-focus-cycle-id", "data"),
     State("quarterly-summary-note", "value"),
     State("quarterly-refresh", "data"),
     prevent_initial_call=True,

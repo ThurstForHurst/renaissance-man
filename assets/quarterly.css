@@ -77,6 +77,13 @@
   background: rgba(255, 255, 255, 0.82);
 }
 
+.quarterly-badge-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.45rem;
+}
+
 .quarterly-phase-badge {
   display: inline-flex;
   align-items: center;
@@ -92,6 +99,11 @@
 .quarterly-phase-execution {
   background: #dceaf9;
   color: #0b4a8b;
+}
+
+.quarterly-phase-planning {
+  background: #e7f3eb;
+  color: #17653c;
 }
 
 .quarterly-phase-review {
@@ -546,6 +558,126 @@
   background: linear-gradient(180deg, #f9fbff, #f3f8ff);
 }
 
+.quarterly-builder-target,
+.quarterly-builder-preview,
+.quarterly-handoff-panel,
+.quarterly-measured-summary-card {
+  border: 1px solid var(--quarterly-border);
+  border-radius: 14px;
+  background: linear-gradient(180deg, #fbfdff, #f5f9fd);
+}
+
+.quarterly-builder-target {
+  padding: 0.95rem 1rem;
+}
+
+.quarterly-builder-kicker,
+.quarterly-builder-preview-title,
+.quarterly-handoff-kicker,
+.quarterly-measured-summary-label {
+  display: block;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #627084;
+}
+
+.quarterly-builder-quarter,
+.quarterly-handoff-title,
+.quarterly-measured-summary-value {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--quarterly-ink);
+  font-size: 1.05rem;
+}
+
+.quarterly-builder-window,
+.quarterly-builder-preview-copy,
+.quarterly-handoff-window,
+.quarterly-measured-summary-detail {
+  display: block;
+  margin-top: 0.2rem;
+  color: #607084;
+  font-size: 0.9rem;
+}
+
+.quarterly-builder-preview {
+  padding: 0.9rem 0.95rem;
+}
+
+.quarterly-handoff-panel {
+  min-width: 240px;
+  padding: 0.95rem 1rem;
+}
+
+.quarterly-handoff-divider {
+  margin: 0.75rem 0;
+}
+
+.quarterly-review-alert {
+  border-radius: 14px;
+}
+
+.quarterly-measured-panel {
+  margin-bottom: 1rem;
+}
+
+.quarterly-measured-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.quarterly-measured-summary-card {
+  padding: 0.85rem 0.95rem;
+}
+
+.quarterly-measured-table {
+  display: grid;
+  grid-template-columns: 130px 120px 120px minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.quarterly-measured-table-header {
+  padding: 0 0.15rem 0.35rem;
+  border-bottom: 1px solid var(--quarterly-border);
+}
+
+.quarterly-measured-table-row {
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--quarterly-border);
+  border-radius: 12px;
+  background: #fcfdff;
+}
+
+.quarterly-measured-table-head {
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #627084;
+}
+
+.quarterly-measured-table-date,
+.quarterly-measured-table-value,
+.quarterly-measured-table-change,
+.quarterly-measured-table-note {
+  color: var(--quarterly-ink);
+  font-size: 0.92rem;
+}
+
+.quarterly-measured-table-date {
+  font-weight: 700;
+  color: #445264;
+}
+
+.quarterly-measured-table-change {
+  font-weight: 700;
+}
+
 .quarterly-type-help-title,
 .quarterly-type-help-copy {
   display: block;
@@ -615,9 +747,14 @@
   .quarterly-goal-header,
   .quarterly-progress-caption,
   .quarterly-progress-legend,
-  .quarterly-mandate-block {
+  .quarterly-mandate-block,
+  .quarterly-badge-stack {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .quarterly-measured-table {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -627,7 +764,9 @@
   }
 
   .quarterly-inline-stats,
-  .quarterly-type-grid {
+  .quarterly-type-grid,
+  .quarterly-measured-summary-grid,
+  .quarterly-measured-table {
     grid-template-columns: 1fr;
   }
 
