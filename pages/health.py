@@ -129,7 +129,7 @@ def create_weight_trend_figure(days: int = 90, df: pd.DataFrame | None = None):
     return fig
 
 def create_exercise_trend_figure(days: int = 30, df: pd.DataFrame | None = None):
-    """Create stacked reps bars plus cardio line chart."""
+    """Create daily resistance reps bars plus cardio line chart."""
     df = df if df is not None else get_exercise_trend(days=days)
     fig = go.Figure()
     if df.empty:
@@ -145,6 +145,7 @@ def create_exercise_trend_figure(days: int = 30, df: pd.DataFrame | None = None)
         return fig
 
     df['date'] = pd.to_datetime(df['date'])
+    one_day_ms = 24 * 60 * 60 * 1000
     cardio_by_date = (
         df.groupby('date', as_index=False)['cardio_min']
         .max()
@@ -153,22 +154,18 @@ def create_exercise_trend_figure(days: int = 30, df: pd.DataFrame | None = None)
 
     resistance_rows = df[df['exercise_type'].notna() & (df['total_reps'] > 0)].copy()
     if not resistance_rows.empty:
-        pivot = (
-            resistance_rows.pivot_table(
-                index='date',
-                columns='exercise_type',
-                values='total_reps',
-                aggfunc='sum',
-                fill_value=0
-            )
-            .sort_index()
+        resistance_by_date = (
+            resistance_rows.groupby('date', as_index=False)['total_reps']
+            .sum()
+            .sort_values('date')
         )
-        for exercise_type in sorted(pivot.columns):
-            fig.add_trace(go.Bar(
-                x=pivot.index,
-                y=pivot[exercise_type],
-                name=exercise_type.replace('_', ' ').title(),
-            ))
+        fig.add_trace(go.Bar(
+            x=resistance_by_date['date'],
+            y=resistance_by_date['total_reps'],
+            name='Resistance Reps',
+            marker_color='#2563eb',
+            width=one_day_ms * 0.72,
+        ))
 
     fig.add_trace(go.Scatter(
         x=cardio_by_date['date'],
@@ -188,7 +185,6 @@ def create_exercise_trend_figure(days: int = 30, df: pd.DataFrame | None = None)
         xaxis_title="Date",
         yaxis=dict(title="Resistance Reps"),
         yaxis2=dict(title="Cardio Minutes", overlaying="y", side="right", rangemode='tozero'),
-        barmode='stack',
         hovermode="x unified",
         margin=dict(l=24, r=24, t=44, b=24),
         height=360,
@@ -207,9 +203,6 @@ def create_exercise_trend_figure(days: int = 30, df: pd.DataFrame | None = None)
         linecolor="#d0d7e2",
         gridcolor="#eef2f7",
         zeroline=False
-    )
-    fig.update_layout(
-        colorway=["#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0ea5e9", "#ca8a04"]
     )
     return fig
 
