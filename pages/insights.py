@@ -245,26 +245,32 @@ def _get_personal_records() -> list[dict]:
     conn = get_connection()
     records: list[dict] = []
 
-    best_sleep_week = conn.execute(
+    sleep_week_df = _query_dataframe(
         """
-        SELECT
-            date(date, 'weekday 0', '-7 days') AS week_start,
-            AVG(energy) AS avg_energy,
-            AVG(duration_minutes) / 60.0 AS avg_hours
+        SELECT date, energy, duration_minutes
         FROM sleep_logs
         WHERE date >= ?
-        GROUP BY week_start
-        ORDER BY avg_energy DESC, avg_hours DESC
-        LIMIT 1
+        ORDER BY date
         """,
         (cutoff_120,),
-    ).fetchone()
-    if best_sleep_week:
+    )
+    if not sleep_week_df.empty:
+        sleep_week_df["date"] = pd.to_datetime(sleep_week_df["date"])
+        sleep_week_df["week_start"] = sleep_week_df["date"].dt.to_period("W-SAT").apply(lambda period: period.start_time)
+        sleep_weekly = (
+            sleep_week_df.groupby("week_start", as_index=False)
+            .agg(avg_energy=("energy", "mean"), avg_hours=("duration_minutes", lambda series: series.mean() / 60.0))
+            .sort_values(["avg_energy", "avg_hours"], ascending=[False, False])
+        )
+        best_sleep_week = sleep_weekly.iloc[0]
         records.append(
             {
                 "label": "Best Sleep Week",
                 "value": f"{float(best_sleep_week['avg_energy'] or 0):.1f}/5",
-                "detail": f"Week of {best_sleep_week['week_start']} with {float(best_sleep_week['avg_hours'] or 0):.1f}h average sleep.",
+                "detail": (
+                    f"Week of {best_sleep_week['week_start'].strftime('%Y-%m-%d')} "
+                    f"with {float(best_sleep_week['avg_hours'] or 0):.1f}h average sleep."
+                ),
             }
         )
 
@@ -304,26 +310,32 @@ def _get_personal_records() -> list[dict]:
             }
         )
 
-    strongest_project_week = conn.execute(
+    project_week_df = _query_dataframe(
         """
-        SELECT
-            date(date, 'weekday 0', '-7 days') AS week_start,
-            COUNT(*) AS sessions,
-            SUM(duration_min) AS total_min
+        SELECT date, duration_min
         FROM project_sessions
         WHERE date >= ?
-        GROUP BY week_start
-        ORDER BY total_min DESC, sessions DESC
-        LIMIT 1
+        ORDER BY date
         """,
         (cutoff_120,),
-    ).fetchone()
-    if strongest_project_week:
+    )
+    if not project_week_df.empty:
+        project_week_df["date"] = pd.to_datetime(project_week_df["date"])
+        project_week_df["week_start"] = project_week_df["date"].dt.to_period("W-SAT").apply(lambda period: period.start_time)
+        project_weekly = (
+            project_week_df.groupby("week_start", as_index=False)
+            .agg(sessions=("date", "count"), total_min=("duration_min", "sum"))
+            .sort_values(["total_min", "sessions"], ascending=[False, False])
+        )
+        strongest_project_week = project_weekly.iloc[0]
         records.append(
             {
                 "label": "Strongest Project Week",
                 "value": f"{int(strongest_project_week['total_min'] or 0)} min",
-                "detail": f"Week of {strongest_project_week['week_start']} across {int(strongest_project_week['sessions'] or 0)} sessions.",
+                "detail": (
+                    f"Week of {strongest_project_week['week_start'].strftime('%Y-%m-%d')} "
+                    f"across {int(strongest_project_week['sessions'] or 0)} sessions."
+                ),
             }
         )
 
@@ -687,7 +699,7 @@ def layout():
                     "Weekly direction across recovery, training, and focused work",
                     dcc.Graph(id="insights-trends-chart", config={"displayModeBar": False}),
                 ),
-                class_name="mb-3",
+                className="mb-3",
             ),
         ],
         fluid=True,
